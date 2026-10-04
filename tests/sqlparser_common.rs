@@ -15260,6 +15260,102 @@ fn test_any_some_all_comparison() {
 }
 
 #[test]
+fn test_any_some_all_expression_operand() {
+    // The parenthesized operand is parsed independently of the precedence
+    // of the outer comparison operator.
+    verified_stmt("SELECT a = ANY(b OR c)");
+    verified_stmt("SELECT a = ALL(b AND c)");
+    verified_stmt("SELECT a = SOME(NOT b)");
+    verified_stmt("SELECT a = ANY(b = c)");
+    verified_stmt("SELECT a = ANY((b OR c))");
+    verified_stmt("SELECT a = ANY((b))");
+
+    // The closing parenthesis terminates the operand: a trailing operator
+    // applies to the whole quantified comparison.
+    let select = verified_only_select("SELECT a = ANY(b) + 1");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::AnyOp {
+                left: Box::new(Expr::Identifier(Ident::new("a"))),
+                compare_op: BinaryOperator::Eq,
+                right: Box::new(Expr::Identifier(Ident::new("b"))),
+                is_some: false,
+            }),
+            op: BinaryOperator::Plus,
+            right: Box::new(Expr::Value((number("1")).with_empty_span())),
+        }),
+        select.projection[0]
+    );
+    verified_stmt("SELECT a = ANY(b) AND c");
+    verified_stmt("SELECT a = ANY(b) OR c");
+    verified_stmt("SELECT a = ANY(b) IS NULL");
+    verified_stmt("SELECT a = ANY(b), c FROM t");
+}
+
+#[test]
+fn test_any_some_all_subquery_operand() {
+    // The closing parenthesis terminates the subquery operand: `+ 1` applies
+    // to the whole quantified comparison, not to the subquery.
+    let select = verified_only_select("SELECT a = ANY(SELECT b FROM t) + 1");
+    match &select.projection[0] {
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Plus,
+            ..
+        }) => assert!(matches!(left.as_ref(), Expr::AnyOp { .. })),
+        other => panic!("expected (a = ANY(...)) + 1, got {other:?}"),
+    }
+    verified_stmt("SELECT a = ALL(SELECT b FROM t) + 1");
+    verified_stmt("SELECT a = SOME(SELECT b FROM t) + 1");
+    verified_stmt("SELECT a = ANY(SELECT b FROM t) AND c");
+    verified_stmt("SELECT a = ANY(SELECT b FROM t WHERE c UNION SELECT d FROM t)");
+
+    // A parenthesized scalar subquery keeps its grouping parentheses and
+    // stays distinguishable from a direct subquery operand.
+    let direct = verified_only_select("SELECT a = ANY(SELECT arr FROM t)");
+    let grouped = verified_only_select("SELECT a = ANY((SELECT arr FROM t))");
+    match &direct.projection[0] {
+        SelectItem::UnnamedExpr(Expr::AnyOp { right, .. }) => {
+            assert!(matches!(right.as_ref(), Expr::Subquery(_)))
+        }
+        other => panic!("expected AnyOp, got {other:?}"),
+    }
+    match &grouped.projection[0] {
+        SelectItem::UnnamedExpr(Expr::AnyOp { right, .. }) => match right.as_ref() {
+            Expr::Nested(inner) => assert!(matches!(inner.as_ref(), Expr::Subquery(_))),
+            other => panic!("expected Nested(Subquery), got {other:?}"),
+        },
+        other => panic!("expected AnyOp, got {other:?}"),
+    }
+    assert_ne!(direct, grouped);
+    verified_stmt("SELECT a = ALL((SELECT arr FROM t))");
+    verified_stmt("SELECT a = SOME((SELECT arr FROM t))");
+    verified_stmt("SELECT a = ANY((SELECT x) + 1)");
+}
+
+#[test]
+fn test_any_some_all_comparison_errors() {
+    for sql in [
+        // Empty operand.
+        "SELECT a = ANY()",
+        // A comma-separated list is not a single expression.
+        "SELECT a = ANY(b, c)",
+        // Missing closing parenthesis (must not borrow parens from a later
+        // statement).
+        "SELECT a = ANY(b; SELECT (1)",
+        // Missing opening parenthesis.
+        "SELECT a = ANY b",
+        // `ANY` is only supported after comparison operators.
+        "SELECT a + ANY(b)",
+    ] {
+        assert!(
+            parse_sql_statements(sql).is_err(),
+            "expected a parse error for: {sql}"
+        );
+    }
+}
+
+#[test]
 fn test_alias_equal_expr() {
     let dialects = all_dialects_where(|d| d.supports_eq_alias_assignment());
     let sql = r#"SELECT some_alias = some_column FROM some_table"#;

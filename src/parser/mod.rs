@@ -2404,6 +2404,45 @@ impl<'a> Parser<'a> {
         Ok(Some(Expr::Subquery(self.parse_query()?)))
     }
 
+    /// Parses the operand of an `ANY` / `ALL` / `SOME` comparison, e.g. the
+    /// `b OR c` in `a = ANY(b OR c)`. Assumes the opening parenthesis of the
+    /// operand has been consumed; consumes the closing parenthesis.
+    ///
+    /// The operand is parsed independently of the precedence of the outer
+    /// comparison operator, and its closing parenthesis always terminates it:
+    /// in `a = ANY(SELECT b FROM t) + 1` the `+ 1` applies to the whole
+    /// quantified comparison, not to the operand.
+    fn parse_any_all_some_operand(&mut self) -> Result<Expr, ParserError> {
+        if self.peek_sub_query() {
+            // We have a subquery ahead (SELECT\WITH ...): the parentheses
+            // belong to the subquery itself, so rewind and parse only the
+            // parenthesized subquery expression, without letting trailing
+            // operators bind to the operand.
+            self.prev_token(); // LParen
+            self.parse_prefix()
+        } else if let Some(nested) = self.maybe_parse(|p| {
+            // `ANY((SELECT ...))`: a parenthesized scalar subquery. Keep the
+            // grouping parentheses so this form stays distinguishable from
+            // the direct subquery form above.
+            p.expect_token(&Token::LParen)?;
+            if !p.peek_sub_query() {
+                return p.expected_ref("SELECT or WITH", p.peek_token_ref());
+            }
+            let subquery = Expr::Subquery(p.parse_query()?);
+            p.expect_token(&Token::RParen)?;
+            p.expect_token(&Token::RParen)?;
+            Ok(Expr::Nested(Box::new(subquery)))
+        })? {
+            Ok(nested)
+        } else {
+            // A single expression, parsed with the dialect's usual precedence
+            // rules (AND/OR, comparisons, NOT, explicit nested parentheses).
+            let right = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            Ok(right)
+        }
+    }
+
     fn try_parse_lambda(&mut self) -> Result<Option<Expr>, ParserError> {
         if !self.dialect.supports_lambda_functions() {
             return Ok(None);
@@ -4046,17 +4085,7 @@ impl<'a> Parser<'a> {
                 self.parse_one_of_keywords(&[Keyword::ANY, Keyword::ALL, Keyword::SOME])
             {
                 self.expect_token(&Token::LParen)?;
-                let right = if self.peek_sub_query() {
-                    // We have a subquery ahead (SELECT\WITH ...) need to rewind and
-                    // use the parenthesis for parsing the subquery as an expression.
-                    self.prev_token(); // LParen
-                    self.parse_subexpr(precedence)?
-                } else {
-                    // Non-subquery expression
-                    let right = self.parse_subexpr(precedence)?;
-                    self.expect_token(&Token::RParen)?;
-                    right
-                };
+                let right = self.parse_any_all_some_operand()?;
 
                 if !matches!(
                     op,

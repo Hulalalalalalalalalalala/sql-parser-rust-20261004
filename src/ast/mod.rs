@@ -1750,6 +1750,19 @@ impl fmt::Display for CastFormat {
     }
 }
 
+/// Returns true if the operand of an `ANY` / `ALL` / `SOME` comparison is
+/// already parenthesized, so its parentheses double as the parentheses of
+/// the quantified operand: a direct subquery (`ANY(SELECT ...)`), or a
+/// parenthesized scalar subquery (`ANY((SELECT ...))`), whose grouping
+/// parentheses are preserved by the parser as an [Expr::Nested].
+fn any_all_some_operand_is_parenthesized(operand: &Expr) -> bool {
+    match operand {
+        Expr::Subquery(_) => true,
+        Expr::Nested(inner) => matches!(inner.as_ref(), Expr::Subquery(_)),
+        _ => false,
+    }
+}
+
 impl fmt::Display for Expr {
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1947,7 +1960,7 @@ impl fmt::Display for Expr {
                 right,
                 is_some,
             } => {
-                let add_parens = !matches!(right.as_ref(), Expr::Subquery(_));
+                let add_parens = !any_all_some_operand_is_parenthesized(right);
                 write!(
                     f,
                     "{left} {compare_op} {}{}{right}{}",
@@ -1961,7 +1974,7 @@ impl fmt::Display for Expr {
                 compare_op,
                 right,
             } => {
-                let add_parens = !matches!(right.as_ref(), Expr::Subquery(_));
+                let add_parens = !any_all_some_operand_is_parenthesized(right);
                 write!(
                     f,
                     "{left} {compare_op} ALL{}{right}{}",
