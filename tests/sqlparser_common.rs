@@ -20234,6 +20234,39 @@ fn parse_unary_minus_never_renders_line_comment() {
 }
 
 #[test]
+fn parse_unary_sign_precedence_non_pg() {
+    // Outside PostgreSQL, a unary sign binds more tightly than `*`, `/`
+    // and binary `+` / `-`, so the sign only wraps the immediate operand.
+    let select = all_dialects().verified_only_select("SELECT -a * b");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::Identifier(Ident::new("a"))),
+            }),
+            op: BinaryOperator::Multiply,
+            right: Box::new(Expr::Identifier(Ident::new("b"))),
+        }),
+        select.projection[0]
+    );
+
+    // `^` is bitwise XOR (not exponentiation) outside PostgreSQL and
+    // binds less tightly than the unary sign.
+    let select = all_dialects_but_pg().verified_only_select("SELECT -2 ^ 2");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::value(number("2"))),
+            }),
+            op: BinaryOperator::BitwiseXor,
+            right: Box::new(Expr::value(number("2"))),
+        }),
+        select.projection[0]
+    );
+}
+
+#[test]
 fn parse_table_preserves_quotes_and_trailing_tokens() {
     let dialects = TestedDialects::new(vec![
         Box::new(AnsiDialect {}),

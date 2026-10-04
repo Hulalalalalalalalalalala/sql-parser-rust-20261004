@@ -1055,6 +1055,22 @@ pub trait Dialect: Debug + Any {
         0
     }
 
+    /// Decide the precedence at which the operand of a unary `+` or `-`
+    /// sign is parsed, i.e. how tightly the sign binds to the expression
+    /// that follows it.
+    ///
+    /// Only infix operators whose precedence is strictly greater than the
+    /// returned value become part of the operand; operators with a lower
+    /// or equal precedence apply to the result of the unary operation
+    /// instead. For example, PostgreSQL parses `-2 ^ 2` as `(-2) ^ 2`
+    /// because its unary sign binds more tightly than `^`.
+    ///
+    /// The default implementation preserves the historical behavior of
+    /// parsing the operand at [`Precedence::MulDivModOp`] precedence.
+    fn unary_plus_minus_precedence(&self) -> u8 {
+        self.prec_value(Precedence::MulDivModOp)
+    }
+
     /// Returns true if this dialect requires the `TABLE` keyword after `DESCRIBE`
     ///
     /// Defaults to false.

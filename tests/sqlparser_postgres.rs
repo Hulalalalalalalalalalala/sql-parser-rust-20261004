@@ -10088,6 +10088,261 @@ fn parse_unary_minus_before_pg_prefix_operators() {
 }
 
 #[test]
+fn parse_pg_unary_sign_binds_tighter_than_exponent() {
+    // In PostgreSQL, unary `+` / `-` bind more tightly than `^`, `* / %`
+    // and binary `+ -`, so `-2 ^ 2` is `(-2) ^ 2`, not `-(2 ^ 2)`.
+    // See <https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE>
+    let select = pg().verified_only_select("SELECT -2 ^ 2");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::value(number("2"))),
+            }),
+            op: BinaryOperator::PGExp,
+            right: Box::new(Expr::value(number("2"))),
+        }),
+        select.projection[0]
+    );
+
+    // A unary plus forms a unary expression before the exponentiation.
+    let select = pg().verified_only_select("SELECT +a ^ b");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr: Box::new(Expr::Identifier(Ident::new("a"))),
+            }),
+            op: BinaryOperator::PGExp,
+            right: Box::new(Expr::Identifier(Ident::new("b"))),
+        }),
+        select.projection[0]
+    );
+
+    // The right operand of `^` may itself be negated.
+    let select = pg().verified_only_select("SELECT a ^ -b");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("a"))),
+            op: BinaryOperator::PGExp,
+            right: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::Identifier(Ident::new("b"))),
+            }),
+        }),
+        select.projection[0]
+    );
+
+    // Consecutive exponentiations keep associating left to right.
+    let select = pg().verified_only_select("SELECT -a ^ b ^ c");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Identifier(Ident::new("a"))),
+                }),
+                op: BinaryOperator::PGExp,
+                right: Box::new(Expr::Identifier(Ident::new("b"))),
+            }),
+            op: BinaryOperator::PGExp,
+            right: Box::new(Expr::Identifier(Ident::new("c"))),
+        }),
+        select.projection[0]
+    );
+
+    // Explicit parentheses still negate the whole exponentiation.
+    let select = pg().verified_only_select("SELECT -(a ^ b)");
+    assert!(matches!(
+        expr_from_projection(&select.projection[0]),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if matches!(
+            expr.as_ref(),
+            Expr::Nested(inner) if matches!(
+                inner.as_ref(),
+                Expr::BinaryOp {
+                    op: BinaryOperator::PGExp,
+                    ..
+                }
+            )
+        )
+    ));
+
+    // Stacked signs both stay inside the left operand of `^`.
+    let select = pg().verified_only_select("SELECT - -a ^ b");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Identifier(Ident::new("a"))),
+                }),
+            }),
+            op: BinaryOperator::PGExp,
+            right: Box::new(Expr::Identifier(Ident::new("b"))),
+        }),
+        select.projection[0]
+    );
+
+    // A sign may also follow a binary subtraction.
+    let select = pg().verified_only_select("SELECT a - -b");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("a"))),
+            op: BinaryOperator::Minus,
+            right: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::Identifier(Ident::new("b"))),
+            }),
+        }),
+        select.projection[0]
+    );
+}
+
+#[test]
+fn parse_pg_unary_sign_binds_looser_than_postfix_access() {
+    // Field access, subscript and `::` casts bind more tightly than a
+    // unary sign, so the sign wraps the whole `items[1]::INT` and the
+    // exponentiation applies to the negated value.
+    let select = pg().verified_only_select("SELECT -items[1]::INT ^ 2");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::Cast {
+                    kind: CastKind::DoubleColon,
+                    expr: Box::new(Expr::CompoundFieldAccess {
+                        root: Box::new(Expr::Identifier(Ident::new("items"))),
+                        access_chain: vec![AccessExpr::Subscript(Subscript::Index {
+                            index: Expr::value(number("1")),
+                        })],
+                    }),
+                    data_type: DataType::Int(None),
+                    format: None,
+                }),
+            }),
+            op: BinaryOperator::PGExp,
+            right: Box::new(Expr::value(number("2"))),
+        }),
+        select.projection[0]
+    );
+}
+
+#[test]
+fn parse_pg_unary_sign_binds_tighter_than_collate_and_at_time_zone() {
+    // `COLLATE` applies to the negated expression, not to `name` alone.
+    let select = pg().verified_only_select(r#"SELECT -name COLLATE "C""#);
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::Collate {
+            expr: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::Identifier(Ident::new("name"))),
+            }),
+            collation: ObjectName(vec![ObjectNamePart::Identifier(Ident::with_quote(
+                '"', "C"
+            ))]),
+        }),
+        select.projection[0]
+    );
+
+    // `AT TIME ZONE` applies to the negated expression, not to `ts` alone.
+    let select = pg().verified_only_select("SELECT -ts AT TIME ZONE 'UTC'");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::AtTimeZone {
+            timestamp: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::Identifier(Ident::new("ts"))),
+            }),
+            time_zone: Box::new(Expr::Value(
+                Value::SingleQuotedString("UTC".to_string()).with_empty_span()
+            )),
+        }),
+        select.projection[0]
+    );
+}
+
+#[test]
+fn pg_unary_sign_display_round_trip() {
+    // The rendered SQL (both plain and pretty-printed) re-parses to the
+    // same AST: operators, parentheses and associativity are preserved
+    // and adjacent signs never fuse into a comment or another operator.
+    for sql in [
+        "SELECT -2 ^ 2",
+        "SELECT +a ^ b",
+        "SELECT a ^ -b",
+        "SELECT -a ^ b ^ c",
+        "SELECT -items[1]::INT ^ 2",
+        r#"SELECT -name COLLATE "C""#,
+        "SELECT -ts AT TIME ZONE 'UTC'",
+        "SELECT -(a ^ b)",
+        "SELECT - -a ^ b",
+        "SELECT - - -a",
+        "SELECT a - -b",
+    ] {
+        let stmt = pg().verified_stmt(sql);
+        let pretty = format!("{stmt:#}");
+        assert_eq!(
+            stmt,
+            pg().one_statement_parses_to(&pretty, sql),
+            "pretty-printed SQL did not round-trip for {sql}"
+        );
+    }
+}
+
+#[test]
+fn parse_pg_unary_sign_missing_operand() {
+    for sql in ["SELECT -", "SELECT a ^ -"] {
+        let err = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap_err();
+        assert_eq!(
+            ParserError::ParserError("Expected: an expression, found: EOF".to_string()),
+            err,
+            "unexpected error for {sql}"
+        );
+    }
+
+    let err = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT -(a ^ )").unwrap_err();
+    assert_eq!(
+        ParserError::ParserError(
+            "Expected: an expression, found: ) at Line: 1, Column: 14".to_string()
+        ),
+        err
+    );
+}
+
+#[test]
+#[cfg(all(feature = "serde", feature = "serde_json"))]
+fn pg_unary_sign_serde_round_trip() {
+    // The distinctions between e.g. `(-2) ^ 2`, `-(2 ^ 2)` and `- -a ^ b`
+    // survive serializing the AST and reading it back.
+    for sql in [
+        "SELECT -2 ^ 2",
+        "SELECT +a ^ b",
+        "SELECT a ^ -b",
+        "SELECT -a ^ b ^ c",
+        "SELECT -items[1]::INT ^ 2",
+        r#"SELECT -name COLLATE "C""#,
+        "SELECT -ts AT TIME ZONE 'UTC'",
+        "SELECT -(a ^ b)",
+        "SELECT - -a ^ b",
+    ] {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let json = serde_json::to_string(&ast).unwrap();
+        let deserialized: Vec<Statement> = serde_json::from_str(&json).unwrap();
+        assert_eq!(ast, deserialized, "serde round trip failed for {sql}");
+    }
+
+    // `(-2) ^ 2` and `-(2 ^ 2)` serialize differently.
+    let json_of = |sql: &str| {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        serde_json::to_string(&ast).unwrap()
+    };
+    assert_ne!(json_of("SELECT -2 ^ 2"), json_of("SELECT -(2 ^ 2)"));
+}
+
+#[test]
 fn parse_postfix_factorial_spacing() {
     pg().verified_stmt("SELECT a!");
     pg().verified_stmt("SELECT 5!");

@@ -1431,7 +1431,17 @@ impl<'a> Parser<'a> {
         // Parse an optional collation cast operator following `expr`.
         //
         // For example (MSSQL): t1.a COLLATE Latin1_General_CI_AS
-        if !self.in_column_definition_state() && self.parse_keyword(Keyword::COLLATE) {
+        //
+        // Dialects that assign `COLLATE` an infix precedence (e.g.
+        // PostgreSQL) only fold it into `expr` when it binds tighter than
+        // the current precedence level; otherwise it is left to the
+        // surrounding expression, so that e.g. `-name COLLATE "C"`
+        // attaches the collation to the negated expression.
+        if !self.in_column_definition_state()
+            && matches!(&self.peek_token_ref().token, Token::Word(w) if w.keyword == Keyword::COLLATE)
+            && self.collate_binds_to_prefix(precedence)?
+        {
+            self.advance_token(); // COLLATE
             expr = Expr::Collate {
                 expr: Box::new(expr),
                 collation: self.parse_object_name(false)?,
@@ -1456,6 +1466,22 @@ impl<'a> Parser<'a> {
             expr = self.parse_infix(expr, next_precedence)?;
         }
         Ok(expr)
+    }
+
+    /// Whether a `COLLATE` keyword directly following a prefix expression
+    /// binds to that expression when parsing at `precedence`.
+    ///
+    /// Dialects that treat `COLLATE` as a regular infix operator (e.g.
+    /// PostgreSQL) only bind it to the prefix when its precedence is
+    /// greater than `precedence`. Other dialects retain the historical
+    /// behavior of always attaching `COLLATE` to the preceding prefix
+    /// expression.
+    fn collate_binds_to_prefix(&self, precedence: u8) -> Result<bool, ParserError> {
+        match self.dialect.get_next_precedence(self) {
+            Some(Ok(collate_precedence)) => Ok(precedence < collate_precedence),
+            Some(Err(e)) => Err(e),
+            None => Ok(true),
+        }
     }
 
     /// Parse `ASSERT` statement.
@@ -1923,9 +1949,7 @@ impl<'a> Parser<'a> {
                 };
                 Ok(Expr::UnaryOp {
                     op,
-                    expr: Box::new(
-                        self.parse_subexpr(self.dialect.prec_value(Precedence::MulDivModOp))?,
-                    ),
+                    expr: Box::new(self.parse_subexpr(self.dialect.unary_plus_minus_precedence())?),
                 })
             }
             Token::ExclamationMark if dialect.supports_bang_not_operator() => Ok(Expr::UnaryOp {
