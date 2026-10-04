@@ -871,6 +871,31 @@ impl fmt::Display for CaseWhen {
     }
 }
 
+/// The `ASYMMETRIC` or `SYMMETRIC` modifier of a `BETWEEN` predicate, e.g.
+/// `x BETWEEN SYMMETRIC 1 AND 2`.
+///
+/// See [`Expr::ModifiedBetween`].
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum BetweenModifier {
+    /// `ASYMMETRIC`: the bounds are used as written (the default behavior
+    /// of a plain `BETWEEN`).
+    Asymmetric,
+    /// `SYMMETRIC`: the bounds may be used in either order, e.g. PostgreSQL
+    /// swaps them when the lower bound is greater than the upper bound.
+    Symmetric,
+}
+
+impl fmt::Display for BetweenModifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BetweenModifier::Asymmetric => write!(f, "ASYMMETRIC"),
+            BetweenModifier::Symmetric => write!(f, "SYMMETRIC"),
+        }
+    }
+}
+
 /// An SQL expression of any type.
 ///
 /// # Semantics / Type Checking
@@ -1008,6 +1033,27 @@ pub enum Expr {
         expr: Box<Expr>,
         /// `true` when the `NOT` modifier is present.
         negated: bool,
+        /// Lower bound.
+        low: Box<Expr>,
+        /// Upper bound.
+        high: Box<Expr>,
+    },
+    /// `<expr> [ NOT ] BETWEEN ASYMMETRIC <low> AND <high>` or
+    /// `<expr> [ NOT ] BETWEEN SYMMETRIC <low> AND <high>`
+    ///
+    /// Same as [`Expr::Between`], but with an explicit `ASYMMETRIC` or
+    /// `SYMMETRIC` modifier, e.g. [PostgreSQL]. A `BETWEEN` without a
+    /// modifier is represented by [`Expr::Between`], so the two are
+    /// distinguishable from an explicit `ASYMMETRIC`.
+    ///
+    /// [PostgreSQL]: https://www.postgresql.org/docs/current/functions-comparison.html
+    ModifiedBetween {
+        /// Expression being compared.
+        expr: Box<Expr>,
+        /// `true` when the `NOT` modifier is present.
+        negated: bool,
+        /// The `ASYMMETRIC` or `SYMMETRIC` modifier.
+        modifier: BetweenModifier,
         /// Lower bound.
         low: Box<Expr>,
         /// Upper bound.
@@ -1853,6 +1899,21 @@ impl fmt::Display for Expr {
                 "{} {}BETWEEN {} AND {}",
                 expr,
                 if *negated { "NOT " } else { "" },
+                low,
+                high
+            ),
+            Expr::ModifiedBetween {
+                expr,
+                negated,
+                modifier,
+                low,
+                high,
+            } => write!(
+                f,
+                "{} {}BETWEEN {} {} AND {}",
+                expr,
+                if *negated { "NOT " } else { "" },
+                modifier,
                 low,
                 high
             ),
