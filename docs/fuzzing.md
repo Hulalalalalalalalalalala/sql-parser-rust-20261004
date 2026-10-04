@@ -1,0 +1,51 @@
+<!---
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+# Fuzzing
+
+`cargo-fuzz` needs the nightly toolchain. Install it with `rustup toolchain install nightly`, then:
+
+```shell
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz run fuzz_parse_sql fuzz_seeds -- -max_total_time=600
+```
+
+`fuzz_parse_sql` parses the input with every dialect.
+`fuzz_parse_roundtrip` additionally re-parses the SQL rendered by `Display` and fails when a
+rendered statement no longer parses.
+
+`fuzz_sqlite_accepts` compiles the input with a bundled SQLite, without running it, and fails when SQLite accepts SQL that `SQLiteDialect` rejects. Name resolution errors such as a missing table still count as accepted once SQLite has read the statement to its end.
+
+`fuzz_postgres_accepts` parses the input with PostgreSQL's own grammar through `pg_query` and fails when PostgreSQL accepts SQL that `PostgreSqlDialect` rejects.
+
+`fuzz_duckdb_accepts` parses the input with DuckDB's own parser and fails when DuckDB accepts a `SELECT` that `DuckDbDialect` rejects.
+
+The three oracle targets compile their engine from source, so each builds only with its feature, `sqlite`, `postgres` or `duckdb`, as in `cargo +nightly fuzz run --features sqlite fuzz_sqlite_accepts fuzz_seeds`. `cargo +nightly fuzz build --all-features` builds every target.
+
+`fuzz_stage_cost` times tokenizing, parsing and printing the input with every dialect and fails when parsing takes more than 50 times as long as tokenizing, or printing more than 50 times as long as parsing, once the slower stage passes 10 ms. It reports superlinear paths whose cost stays far below the fuzzer's timeout.
+
+ClusterFuzzLite runs continuous fuzzing. Every pull request fuzzes for 10 minutes in
+`code-change` mode, a daily batch job grows the shared corpus stored on the
+`clusterfuzzlite` branch, and a daily prune compacts it.
+
+`fuzz_seeds/` is a committed corpus of valid SQL that random mutation would never produce.
+The run command above uses it and `build.sh` packages it for ClusterFuzzLite.
+
+Crashes land in `artifacts/<target>/` and replay with `cargo fuzz run <target> <crash-file>`.
