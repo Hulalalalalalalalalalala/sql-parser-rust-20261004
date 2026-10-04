@@ -1431,11 +1431,22 @@ impl<'a> Parser<'a> {
         // Parse an optional collation cast operator following `expr`.
         //
         // For example (MSSQL): t1.a COLLATE Latin1_General_CI_AS
-        if !self.in_column_definition_state() && self.parse_keyword(Keyword::COLLATE) {
-            expr = Expr::Collate {
-                expr: Box::new(expr),
-                collation: self.parse_object_name(false)?,
-            };
+        //
+        // Dialects such as PostgreSQL instead parse `COLLATE` through the
+        // infix loop with its own precedence. In that case the precedence
+        // passed by the caller is respected here, so that a tighter prefix
+        // (e.g. unary `-`) does not swallow a trailing `COLLATE`:
+        // `-name COLLATE "C"` must become `(-name) COLLATE "C"`.
+        if !self.in_column_definition_state() && self.peek_keyword(Keyword::COLLATE) {
+            let collate_precedence = self.get_next_precedence()?;
+            if collate_precedence == self.dialect.prec_unknown() || precedence < collate_precedence
+            {
+                let _ = self.parse_keyword(Keyword::COLLATE);
+                expr = Expr::Collate {
+                    expr: Box::new(expr),
+                    collation: self.parse_object_name(false)?,
+                };
+            }
         }
 
         debug!("prefix: {expr:?}");
@@ -1921,11 +1932,16 @@ impl<'a> Parser<'a> {
                 } else {
                     UnaryOperator::Minus
                 };
+                // The binding strength of unary `+`/`-` is dialect-specific.
+                // In PostgreSQL the sign binds more tightly than every binary
+                // operator (`^`, `*` `/`, `+` `-`, ...) but more loosely than
+                // the postfix field access, subscript and `::` cast, so
+                // `-2 ^ 2` is `(-2) ^ 2` while `-items[1]::INT ^ 2` has the
+                // sign wrap the subscripted cast but stay inside the power.
+                // Other dialects keep their historical precedence.
                 Ok(Expr::UnaryOp {
                     op,
-                    expr: Box::new(
-                        self.parse_subexpr(self.dialect.prec_value(Precedence::MulDivModOp))?,
-                    ),
+                    expr: Box::new(self.parse_subexpr(self.dialect.prefix_sign_precedence())?),
                 })
             }
             Token::ExclamationMark if dialect.supports_bang_not_operator() => Ok(Expr::UnaryOp {

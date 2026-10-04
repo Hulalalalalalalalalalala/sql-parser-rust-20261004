@@ -57,6 +57,9 @@ pub struct PostgreSqlDialect {}
 const PERIOD_PREC: u8 = 200;
 const DOUBLE_COLON_PREC: u8 = 140;
 const BRACKET_PREC: u8 = 130;
+// Unary prefix `+`/`-` bind tighter than every binary operator and COLLATE,
+// but looser than field access, subscripts and `::` casts.
+const UNARY_SIGN_PREC: u8 = 125;
 const COLLATE_PREC: u8 = 120;
 const AT_TZ_PREC: u8 = 110;
 const CARET_PREC: u8 = 100;
@@ -205,6 +208,10 @@ impl Dialect for PostgreSqlDialect {
             Precedence::And => AND_PREC,
             Precedence::Or => OR_PREC,
         }
+    }
+
+    fn prefix_sign_precedence(&self) -> u8 {
+        UNARY_SIGN_PREC
     }
 
     fn allow_extract_custom(&self) -> bool {

@@ -1050,6 +1050,22 @@ pub trait Dialect: Debug + Any {
         }
     }
 
+    /// Precedence used when parsing the operand of a prefix `+` or `-`.
+    ///
+    /// A higher value means the sign binds its operand more tightly relative
+    /// to following binary operators. Defaults to
+    /// [`Precedence::MulDivModOp`], the historical behavior shared by the
+    /// generic dialect: `-a * b` is `(-a) * b` while `-a ^ b` keeps the sign
+    /// outside the power when `^` has higher precedence.
+    ///
+    /// PostgreSQL overrides this with a value between its postfix operators
+    /// (`::`, subscripts) and every binary operator, so that e.g. `-2 ^ 2` is
+    /// `(-2) ^ 2` while `-items[1]::INT ^ 2` puts the sign around the cast
+    /// but inside the power.
+    fn prefix_sign_precedence(&self) -> u8 {
+        self.prec_value(Precedence::MulDivModOp)
+    }
+
     /// Returns the precedence when the precedence is otherwise unknown
     fn prec_unknown(&self) -> u8 {
         0

@@ -2642,6 +2642,385 @@ fn parse_pg_unary_ops() {
 }
 
 #[test]
+fn parse_pg_unary_sign_binds_tighter_than_binary_operators() {
+    // In PostgreSQL, unary `+`/`-` bind more tightly than exponentiation,
+    // multiplication/division and binary addition/subtraction.
+    fn select_expr(sql: &str) -> Expr {
+        expr_from_projection(&pg().verified_only_select(sql).projection[0]).clone()
+    }
+    fn ident(name: &str) -> Box<Expr> {
+        Box::new(Expr::Identifier(Ident::new(name)))
+    }
+    fn signed(op: UnaryOperator, expr: Expr) -> Box<Expr> {
+        Box::new(Expr::UnaryOp {
+            op,
+            expr: Box::new(expr),
+        })
+    }
+    fn bin(op: BinaryOperator, left: Box<Expr>, right: Box<Expr>) -> Expr {
+        Expr::BinaryOp { left, op, right }
+    }
+    fn num(n: &str) -> Box<Expr> {
+        Box::new(Expr::Value(number(n).with_empty_span()))
+    }
+
+    // `-2 ^ 2` is `(-2) ^ 2`, not `-(2 ^ 2)`
+    assert_eq!(
+        select_expr("SELECT -2 ^ 2"),
+        bin(
+            BinaryOperator::PGExp,
+            signed(
+                UnaryOperator::Minus,
+                Expr::Value(number("2").with_empty_span())
+            ),
+            num("2")
+        )
+    );
+
+    // `+a ^ b` first forms the unary-plus expression
+    assert_eq!(
+        select_expr("SELECT +a ^ b"),
+        bin(
+            BinaryOperator::PGExp,
+            signed(UnaryOperator::Plus, Expr::Identifier(Ident::new("a"))),
+            ident("b")
+        )
+    );
+
+    // `a ^ -b` takes the negated `b` as its right operand
+    assert_eq!(
+        select_expr("SELECT a ^ -b"),
+        bin(
+            BinaryOperator::PGExp,
+            ident("a"),
+            signed(UnaryOperator::Minus, Expr::Identifier(Ident::new("b")))
+        )
+    );
+
+    // Consecutive powers stay left-associative: `(-a ^ b) ^ c`
+    assert_eq!(
+        select_expr("SELECT -a ^ b ^ c"),
+        bin(
+            BinaryOperator::PGExp,
+            Box::new(bin(
+                BinaryOperator::PGExp,
+                signed(UnaryOperator::Minus, Expr::Identifier(Ident::new("a"))),
+                ident("b")
+            )),
+            ident("c")
+        )
+    );
+
+    // Tighter than multiplication/division and binary plus/minus as well
+    assert_eq!(
+        select_expr("SELECT -a * b"),
+        bin(
+            BinaryOperator::Multiply,
+            signed(UnaryOperator::Minus, Expr::Identifier(Ident::new("a"))),
+            ident("b")
+        )
+    );
+    assert_eq!(
+        select_expr("SELECT -a / b"),
+        bin(
+            BinaryOperator::Divide,
+            signed(UnaryOperator::Minus, Expr::Identifier(Ident::new("a"))),
+            ident("b")
+        )
+    );
+    assert_eq!(
+        select_expr("SELECT -a + b"),
+        bin(
+            BinaryOperator::Plus,
+            signed(UnaryOperator::Minus, Expr::Identifier(Ident::new("a"))),
+            ident("b")
+        )
+    );
+    assert_eq!(
+        select_expr("SELECT a - -b"),
+        bin(
+            BinaryOperator::Minus,
+            ident("a"),
+            signed(UnaryOperator::Minus, Expr::Identifier(Ident::new("b")))
+        )
+    );
+}
+
+#[test]
+fn parse_pg_unary_sign_postfix_precedence() {
+    // Field access, subscripts and `::` casts bind tighter than unary `+`/`-`,
+    // while the sign still binds tighter than `^`.
+    //
+    // `-items[1]::INT ^ 2` => `((-(items[1]::INT)) ^ 2)`
+    let select = pg().verified_only_select("SELECT -items[1]::INT ^ 2");
+    let expr = expr_from_projection(&select.projection[0]);
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOperator::PGExp,
+            left,
+            right,
+        } => {
+            assert!(matches!(right.as_ref(), Expr::Value(_)));
+            match left.as_ref() {
+                Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: cast,
+                } => match cast.as_ref() {
+                    Expr::Cast {
+                        kind: CastKind::DoubleColon,
+                        expr: subscript,
+                        data_type: DataType::Int(None),
+                        ..
+                    } => {
+                        assert!(matches!(
+                            subscript.as_ref(),
+                            Expr::CompoundFieldAccess { .. }
+                        ))
+                    }
+                    other => panic!("expected DoubleColon Cast, got: {other:?}"),
+                },
+                other => panic!("expected unary minus around cast, got: {other:?}"),
+            }
+        }
+        other => panic!("expected PGExp binary op, got: {other:?}"),
+    }
+
+    // `-a.b ^ 2` => `(-(a.b)) ^ 2`
+    let expr = pg().verified_expr("-a.b ^ 2");
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOperator::PGExp,
+            left,
+            ..
+        } => assert!(matches!(
+            *left,
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                ..
+            }
+        )),
+        other => panic!("expected PGExp with signed left operand, got: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_pg_unary_sign_collate_and_at_time_zone_are_outer() {
+    // `COLLATE` and `AT TIME ZONE` attach to the signed expression.
+    match pg().verified_expr(r#"-name COLLATE "C""#) {
+        Expr::Collate { expr, collation } => {
+            assert!(matches!(
+                *expr,
+                Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    ..
+                }
+            ));
+            assert_eq!(collation.to_string(), r#""C""#);
+        }
+        other => panic!("expected Expr::Collate around unary minus, got: {other:?}"),
+    }
+
+    match pg().verified_expr("-ts AT TIME ZONE 'UTC'") {
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            assert!(matches!(
+                *timestamp,
+                Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    ..
+                }
+            ));
+            assert_eq!(time_zone.to_string(), "'UTC'");
+        }
+        other => panic!("expected Expr::AtTimeZone around unary minus, got: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_pg_unary_sign_parens_and_chains() {
+    fn select_expr(sql: &str) -> Expr {
+        expr_from_projection(&pg().verified_only_select(sql).projection[0]).clone()
+    }
+
+    // Explicit parentheses keep the negation outside the whole power:
+    // `-(a ^ b)` stays distinct from `-a ^ b`.
+    assert_eq!(
+        select_expr("SELECT -(a ^ b)"),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(Expr::Nested(Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("a"))),
+                op: BinaryOperator::PGExp,
+                right: Box::new(Expr::Identifier(Ident::new("b"))),
+            }))),
+        }
+    );
+    assert_ne!(select_expr("SELECT -(a ^ b)"), select_expr("SELECT -a ^ b"));
+
+    // Consecutive signs both stay in the left operand of the power:
+    // `- -a ^ b` => `(-(-a)) ^ b`
+    assert_eq!(
+        select_expr("SELECT - -a ^ b"),
+        Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: Box::new(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Identifier(Ident::new("a"))),
+                }),
+            }),
+            op: BinaryOperator::PGExp,
+            right: Box::new(Expr::Identifier(Ident::new("b"))),
+        }
+    );
+
+    // Signs following a binary minus bind to its right operand:
+    // `3 - -a ^ b` => `3 - ((-a) ^ b)`
+    assert_eq!(
+        select_expr("SELECT 3 - -a ^ b"),
+        Expr::BinaryOp {
+            left: Box::new(Expr::Value(number("3").with_empty_span())),
+            op: BinaryOperator::Minus,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: Box::new(Expr::Identifier(Ident::new("a"))),
+                }),
+                op: BinaryOperator::PGExp,
+                right: Box::new(Expr::Identifier(Ident::new("b"))),
+            }),
+        }
+    );
+}
+
+#[test]
+fn parse_pg_unary_sign_missing_operand() {
+    fn err(sql: &str) -> ParserError {
+        pg().parse_sql_statements(sql).unwrap_err()
+    }
+    assert_eq!(
+        err("SELECT -"),
+        ParserError::ParserError("Expected: an expression, found: EOF".to_string())
+    );
+    assert_eq!(
+        err("SELECT a ^ -"),
+        ParserError::ParserError("Expected: an expression, found: EOF".to_string())
+    );
+    assert_eq!(
+        err("SELECT -(a ^ )"),
+        ParserError::ParserError("Expected: an expression, found: )".to_string())
+    );
+}
+
+#[test]
+fn parse_pg_unary_sign_display_round_trips() {
+    let cases = [
+        "SELECT -2 ^ 2",
+        "SELECT +a ^ b",
+        "SELECT a ^ -b",
+        "SELECT -a ^ b ^ c",
+        "SELECT -items[1]::INT ^ 2",
+        "SELECT -name COLLATE \"C\"",
+        "SELECT -ts AT TIME ZONE 'UTC'",
+        "SELECT -(a ^ b)",
+        "SELECT - -a ^ b",
+        "SELECT 3 - -a ^ b",
+    ];
+    for sql in cases {
+        // Normal display round trip: operators, parentheses and grouping survive
+        // re-parsing with the same dialect.
+        pg().verified_stmt(sql);
+
+        // Formatted (`{:#}`) display round trip as well.
+        let ast = pg().parse_sql_statements(sql).unwrap();
+        let formatted = format!("{:#}", ast[0]);
+        let reparsed = pg()
+            .parse_sql_statements(&formatted)
+            .unwrap_or_else(|e| panic!("formatted output failed to re-parse: {formatted}\n{e}"));
+        assert_eq!(
+            ast, reparsed,
+            "formatted round trip changed the AST for {sql}\nformatted:\n{formatted}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(feature = "serde", feature = "serde_json"))]
+fn parse_pg_unary_sign_serde_round_trip() {
+    let cases = [
+        "SELECT -2 ^ 2",
+        "SELECT -items[1]::INT ^ 2",
+        "SELECT -name COLLATE \"C\"",
+        "SELECT -ts AT TIME ZONE 'UTC'",
+        "SELECT -a ^ b ^ c",
+        "SELECT -(a ^ b)",
+        "SELECT - -a ^ b",
+    ];
+    for sql in cases {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let json = serde_json::to_string(&ast).unwrap();
+        let deserialized: Vec<Statement> = serde_json::from_str(&json).unwrap();
+        assert_eq!(ast, deserialized, "serde round trip failed for {sql}");
+    }
+
+    // The distinct groupings must serialize to different trees.
+    let json_of = |sql: &str| {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        serde_json::to_string(&ast).unwrap()
+    };
+    assert_ne!(json_of("SELECT -a ^ b"), json_of("SELECT -(a ^ b)"));
+}
+
+#[test]
+fn generic_dialect_unary_sign_precedence_unchanged() {
+    // The new PostgreSQL rules do not change other dialects. In
+    // GenericDialect `^` is bitwise XOR (not exponentiation) and unary `-`
+    // keeps its historical grouping: the sign binds to `a`, and the XOR is
+    // the outer binary op (`(-a) ^ b`).
+    let ast = Parser::parse_sql(&GenericDialect {}, "SELECT -a ^ b").unwrap();
+    let expr = match &ast[0] {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Select(select) => expr_from_projection(&select.projection[0]),
+            _ => panic!(),
+        },
+        _ => panic!(),
+    };
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOperator::BitwiseXor,
+            left,
+            ..
+        } => assert!(matches!(
+            left.as_ref(),
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                ..
+            }
+        )),
+        other => panic!("expected BitwiseXor with unary-minus left operand, got: {other:?}"),
+    }
+
+    // GenericDialect also keeps `COLLATE`/`AT TIME ZONE` inside the sign.
+    let ast = Parser::parse_sql(&GenericDialect {}, "SELECT -name COLLATE \"C\"").unwrap();
+    let expr = match &ast[0] {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Select(select) => expr_from_projection(&select.projection[0]),
+            _ => panic!(),
+        },
+        _ => panic!(),
+    };
+    assert!(matches!(
+        expr,
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn parse_pg_postfix_factorial() {
     let postfix_factorial = &[("!", UnaryOperator::PGPostfixFactorial)];
 
