@@ -3883,6 +3883,55 @@ impl<'a> Parser<'a> {
         Ok(trailing_bracket)
     }
 
+    /// Parse the operand of `ANY`/`ALL`/`SOME` when it is not a bare
+    /// subquery, i.e. the expression between the parentheses following the
+    /// quantifier keyword (the opening parenthesis has been consumed, the
+    /// closing one has not).
+    ///
+    /// The operand is parsed as a self-contained expression, except that a
+    /// parenthesized scalar subquery that makes up the whole operand keeps
+    /// its grouping parentheses as [Expr::Nested], so that e.g.
+    /// `ANY((SELECT 1))` stays distinguishable from `ANY(SELECT 1)`.
+    fn parse_any_all_some_operand(&mut self) -> Result<Expr, ParserError> {
+        if !matches!(
+            self.peek_tokens(),
+            [
+                Token::LParen,
+                Token::Word(Word {
+                    keyword: Keyword::SELECT | Keyword::WITH,
+                    ..
+                })
+            ]
+        ) {
+            return self.parse_expr();
+        }
+
+        // A parenthesized scalar subquery, e.g. `ANY((SELECT 1))`.
+        self.next_token(); // Consume the inner `(`.
+        let subquery = self.parse_query()?;
+        self.expect_token(&Token::RParen)?;
+        if self.peek_token_ref().token == Token::RParen {
+            // The parenthesized subquery is the whole operand.
+            return Ok(Expr::Nested(Box::new(Expr::Subquery(subquery))));
+        }
+
+        // The subquery is part of a larger operand expression, e.g.
+        // `ANY((SELECT 1) + 2)`: parse the remaining operators.
+        let precedence = self.dialect.prec_unknown();
+        let mut expr = Expr::Subquery(subquery);
+        loop {
+            let next_precedence = self.get_next_precedence()?;
+            if precedence >= next_precedence {
+                break;
+            }
+            if Token::Period == self.peek_token_ref().token {
+                break;
+            }
+            expr = self.parse_infix(expr, next_precedence)?;
+        }
+        Ok(expr)
+    }
+
     /// Parse an operator following an expression
     pub fn parse_infix(&mut self, expr: Expr, precedence: u8) -> Result<Expr, ParserError> {
         // allow the dialect to override infix parsing
@@ -4047,13 +4096,20 @@ impl<'a> Parser<'a> {
             {
                 self.expect_token(&Token::LParen)?;
                 let right = if self.peek_sub_query() {
-                    // We have a subquery ahead (SELECT\WITH ...) need to rewind and
-                    // use the parenthesis for parsing the subquery as an expression.
-                    self.prev_token(); // LParen
-                    self.parse_subexpr(precedence)?
+                    // A subquery operand, e.g. `ANY(SELECT ...)` or
+                    // `ANY(WITH ...)`. The closing parenthesis ends the
+                    // operand, so operators following it apply to the whole
+                    // quantified comparison rather than to the subquery.
+                    let subquery = self.parse_query()?;
+                    self.expect_token(&Token::RParen)?;
+                    Expr::Subquery(subquery)
                 } else {
-                    // Non-subquery expression
-                    let right = self.parse_subexpr(precedence)?;
+                    // Any other operand is a self-contained expression:
+                    // parse it independently of the outer comparison
+                    // operator's precedence, so that e.g. `ANY(b OR c)`
+                    // keeps the whole `b OR c`, and let the closing
+                    // parenthesis end the operand.
+                    let right = self.parse_any_all_some_operand()?;
                     self.expect_token(&Token::RParen)?;
                     right
                 };

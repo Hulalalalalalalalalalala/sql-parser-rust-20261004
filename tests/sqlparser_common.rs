@@ -15260,6 +15260,180 @@ fn test_any_some_all_comparison() {
 }
 
 #[test]
+fn test_any_all_some_parenthesized_expr_operand() {
+    // The parenthesized operand is parsed independently of the outer
+    // comparison operator's precedence.
+    let select = verified_only_select("SELECT a = ANY(b OR c)");
+    assert_eq!(
+        SelectItem::UnnamedExpr(Expr::AnyOp {
+            left: Box::new(Expr::Identifier(Ident::new("a"))),
+            compare_op: BinaryOperator::Eq,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("b"))),
+                op: BinaryOperator::Or,
+                right: Box::new(Expr::Identifier(Ident::new("c"))),
+            }),
+            is_some: false,
+        }),
+        select.projection[0]
+    );
+
+    verified_stmt("SELECT a = ANY(b AND c)");
+    verified_stmt("SELECT a = ALL(NOT b)");
+    verified_stmt("SELECT a = SOME(b OR c)");
+    verified_stmt("SELECT a = ANY(b = c)");
+    // Explicit grouping parentheses inside the operand are preserved.
+    verified_stmt("SELECT a = ANY((b OR c))");
+    verified_stmt("SELECT a = ALL((b))");
+}
+
+#[test]
+fn test_any_all_some_operand_boundary() {
+    // The closing parenthesis ends the operand: operators following it
+    // apply to the whole quantified comparison, not to the operand.
+    let select = verified_only_select("SELECT a = ANY(SELECT b FROM t) + 1");
+    assert_matches!(
+        &select.projection[0],
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Plus,
+            ..
+        }) if matches!(
+            left.as_ref(),
+            Expr::AnyOp { right, .. } if matches!(right.as_ref(), Expr::Subquery(_))
+        )
+    );
+
+    let select = verified_only_select("SELECT a = ANY(b) + 1");
+    assert_matches!(
+        &select.projection[0],
+        SelectItem::UnnamedExpr(Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Plus,
+            ..
+        }) if matches!(left.as_ref(), Expr::AnyOp { .. })
+    );
+
+    verified_stmt("SELECT a = ANY(b) AND c");
+    verified_stmt("SELECT a = ALL(b) OR c");
+    verified_stmt("SELECT a = SOME(b) IS NULL");
+    verified_stmt("SELECT a = ANY(b), c FROM t");
+    // The subquery's own WHERE clause, set operations and inner
+    // parentheses belong to the subquery.
+    verified_stmt("SELECT a = ANY(SELECT b FROM t WHERE b > 0 UNION SELECT c FROM u)");
+    verified_stmt("SELECT a = ALL(SELECT b FROM t WHERE b IN (SELECT c FROM u))");
+}
+
+#[test]
+fn test_any_all_some_subquery_operand_parens() {
+    // A bare subquery operand.
+    let select = verified_only_select("SELECT a = ANY(SELECT arr FROM t)");
+    assert_matches!(
+        &select.projection[0],
+        SelectItem::UnnamedExpr(Expr::AnyOp { right, .. })
+            if matches!(right.as_ref(), Expr::Subquery(_))
+    );
+
+    // A parenthesized scalar subquery keeps its grouping parentheses, so it
+    // stays distinguishable from the bare subquery form.
+    let select = verified_only_select("SELECT a = ANY((SELECT arr FROM t))");
+    assert_matches!(
+        &select.projection[0],
+        SelectItem::UnnamedExpr(Expr::AnyOp { right, .. })
+            if matches!(right.as_ref(), Expr::Nested(inner) if matches!(inner.as_ref(), Expr::Subquery(_)))
+    );
+    // The two forms must not serialize identically.
+    let bare = all_dialects()
+        .parse_sql_statements("SELECT a = ANY(SELECT arr FROM t)")
+        .unwrap();
+    let nested = all_dialects()
+        .parse_sql_statements("SELECT a = ANY((SELECT arr FROM t))")
+        .unwrap();
+    assert_ne!(bare, nested);
+    assert_eq!("SELECT a = ANY(SELECT arr FROM t)", bare[0].to_string());
+    assert_eq!("SELECT a = ANY((SELECT arr FROM t))", nested[0].to_string());
+
+    verified_stmt("SELECT a = ALL((SELECT arr FROM t))");
+    verified_stmt("SELECT a = SOME((SELECT arr FROM t))");
+    verified_stmt("SELECT a = ANY((SELECT x FROM t) + (SELECT y FROM u))");
+}
+
+#[test]
+fn test_any_all_some_round_trip() {
+    // Both the plain and the indented (pretty) output re-parse to the same
+    // AST with the same dialect.
+    for sql in [
+        "SELECT a = ANY(b OR c) FROM t",
+        "SELECT a = ANY(SELECT b FROM t) + 1 FROM t",
+        "SELECT a = ANY((SELECT arr FROM t)) FROM t",
+        "SELECT a = ALL(NOT b) FROM t",
+        "SELECT a = SOME(b AND c) FROM t",
+    ] {
+        let ast = all_dialects().parse_sql_statements(sql).unwrap();
+        let reparsed = all_dialects()
+            .parse_sql_statements(&ast[0].to_string())
+            .unwrap();
+        assert_eq!(ast, reparsed, "plain output of {sql} did not round-trip");
+        let pretty = format!("{:#}", ast[0]);
+        let reparsed = all_dialects().parse_sql_statements(&pretty).unwrap();
+        assert_eq!(ast, reparsed, "indented output of {sql} did not round-trip");
+    }
+}
+
+#[test]
+fn test_any_all_some_operand_errors() {
+    // An empty operand is not allowed.
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a = ANY()")
+        .is_err());
+    // A comma-separated list is not a single operand expression.
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a = ANY(b, c)")
+        .is_err());
+    // Missing parentheses around the operand.
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a = ANY b")
+        .is_err());
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a = ANY(b")
+        .is_err());
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a = ANY(SELECT b FROM t")
+        .is_err());
+    // The parentheses of a following statement must not be borrowed to
+    // complete the operand.
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a = ANY; SELECT (b)")
+        .is_err());
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a = ANY(b; SELECT 1)")
+        .is_err());
+    // ANY/ALL/SOME only support comparison operators.
+    assert!(all_dialects()
+        .parse_sql_statements("SELECT a + ANY(b)")
+        .is_err());
+}
+
+#[cfg(feature = "json_example")]
+#[test]
+fn test_any_all_some_serde_round_trip() {
+    // Serializing and deserializing the AST preserves the operand range,
+    // the grouping parentheses and the quantifier.
+    for sql in [
+        "SELECT a = ANY(b OR c)",
+        "SELECT a = ANY(SELECT arr FROM t)",
+        "SELECT a = ANY((SELECT arr FROM t))",
+        "SELECT a = ALL(NOT b)",
+        "SELECT a = SOME(b)",
+    ] {
+        let ast = all_dialects().parse_sql_statements(sql).unwrap();
+        let serialized = serde_json::to_string(&ast).unwrap();
+        let deserialized: Vec<Statement> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(ast, deserialized, "serde round-trip of {sql} failed");
+    }
+}
+
+#[test]
 fn test_alias_equal_expr() {
     let dialects = all_dialects_where(|d| d.supports_eq_alias_assignment());
     let sql = r#"SELECT some_alias = some_column FROM some_table"#;

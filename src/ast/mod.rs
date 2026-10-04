@@ -1750,6 +1750,19 @@ impl fmt::Display for CastFormat {
     }
 }
 
+/// Returns true if `expr` is a subquery, possibly wrapped in grouping
+/// parentheses, e.g. `(SELECT 1)` or `((SELECT 1))`.
+///
+/// Such expressions are displayed with their own surrounding parentheses,
+/// so e.g. the operand of `ANY`/`ALL`/`SOME` does not need additional ones.
+fn is_parenthesized_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_) => true,
+        Expr::Nested(inner) => is_parenthesized_subquery(inner),
+        _ => false,
+    }
+}
+
 impl fmt::Display for Expr {
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1947,7 +1960,7 @@ impl fmt::Display for Expr {
                 right,
                 is_some,
             } => {
-                let add_parens = !matches!(right.as_ref(), Expr::Subquery(_));
+                let add_parens = !is_parenthesized_subquery(right);
                 write!(
                     f,
                     "{left} {compare_op} {}{}{right}{}",
@@ -1961,7 +1974,7 @@ impl fmt::Display for Expr {
                 compare_op,
                 right,
             } => {
-                let add_parens = !matches!(right.as_ref(), Expr::Subquery(_));
+                let add_parens = !is_parenthesized_subquery(right);
                 write!(
                     f,
                     "{left} {compare_op} ALL{}{right}{}",
