@@ -1988,6 +1988,19 @@ pub trait Dialect: Debug + Any {
     fn supports_cast_empty_data_type_to_unspecified(&self) -> bool {
         false
     }
+
+    /// Returns true if the dialect supports the `ASYMMETRIC` and `SYMMETRIC`
+    /// modifiers in `BETWEEN` predicates.
+    ///
+    /// Example:
+    /// ```sql
+    /// SELECT 1 BETWEEN SYMMETRIC 2 AND 0
+    /// ```
+    ///
+    /// [PostgreSQL](https://www.postgresql.org/docs/current/functions-comparison.html)
+    fn supports_between_symmetric(&self) -> bool {
+        false
+    }
 }
 
 /// Operators for which precedence must be defined.

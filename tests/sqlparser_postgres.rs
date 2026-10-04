@@ -10126,3 +10126,284 @@ fn parse_bitstring_literal_escaping() {
     pg_and_generic().verified_stmt("SELECT B''''");
     pg_and_generic().verified_stmt("SELECT B'it''s'");
 }
+
+#[test]
+fn parse_between_symmetric_asymmetric() {
+    fn projection_expr(sql: &str) -> Expr {
+        let select = pg_and_generic().verified_only_select(sql);
+        expr_from_projection(&select.projection[0]).clone()
+    }
+
+    // `BETWEEN` with no modifier keeps its existing representation.
+    assert_eq!(
+        Expr::Between {
+            expr: Box::new(Expr::Identifier(Ident::new("x"))),
+            negated: false,
+            low: Box::new(Expr::value(number("1"))),
+            high: Box::new(Expr::value(number("2"))),
+        },
+        projection_expr("SELECT x BETWEEN 1 AND 2 FROM t")
+    );
+
+    // Explicit ASYMMETRIC is distinct from an omitted modifier.
+    assert_eq!(
+        Expr::BetweenAsymmetric {
+            expr: Box::new(Expr::Identifier(Ident::new("x"))),
+            negated: false,
+            low: Box::new(Expr::value(number("1"))),
+            high: Box::new(Expr::value(number("2"))),
+        },
+        projection_expr("SELECT x BETWEEN ASYMMETRIC 1 AND 2 FROM t")
+    );
+
+    assert_eq!(
+        Expr::BetweenSymmetric {
+            expr: Box::new(Expr::Identifier(Ident::new("x"))),
+            negated: false,
+            low: Box::new(Expr::value(number("1"))),
+            high: Box::new(Expr::value(number("2"))),
+        },
+        projection_expr("SELECT x BETWEEN SYMMETRIC 1 AND 2 FROM t")
+    );
+
+    // NOT BETWEEN supports both modifiers.
+    assert!(matches!(
+        projection_expr("SELECT x NOT BETWEEN ASYMMETRIC 1 AND 2 FROM t"),
+        Expr::BetweenAsymmetric { negated: true, .. }
+    ));
+    assert!(matches!(
+        projection_expr("SELECT x NOT BETWEEN SYMMETRIC 1 AND 2 FROM t"),
+        Expr::BetweenSymmetric { negated: true, .. }
+    ));
+
+    // Recognition is case-insensitive and unaffected by comments between
+    // the words.
+    pg_and_generic().one_statement_parses_to(
+        "SELECT x BeTwEeN /* comment */ SyMmEtRiC -- another comment\n 1 AND 2 FROM t",
+        "SELECT x BETWEEN SYMMETRIC 1 AND 2 FROM t",
+    );
+    pg_and_generic().one_statement_parses_to(
+        "SELECT x NOT BETWEEN /* comment */ asymmetric 1 AND 2 FROM t",
+        "SELECT x NOT BETWEEN ASYMMETRIC 1 AND 2 FROM t",
+    );
+}
+
+#[test]
+fn parse_between_symmetric_precedence() {
+    fn projection_expr(sql: &str) -> Expr {
+        let select = pg_and_generic().verified_only_select(sql);
+        expr_from_projection(&select.projection[0]).clone()
+    }
+
+    // The modifier does not change the precedence of BETWEEN: the trailing
+    // `AND enabled` is outside of the range comparison.
+    assert_eq!(
+        Expr::BinaryOp {
+            left: Box::new(Expr::BetweenSymmetric {
+                expr: Box::new(Expr::Identifier(Ident::new("x"))),
+                negated: true,
+                low: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("a"))),
+                    op: BinaryOperator::Plus,
+                    right: Box::new(Expr::value(number("1"))),
+                }),
+                high: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("b"))),
+                    op: BinaryOperator::Multiply,
+                    right: Box::new(Expr::value(number("2"))),
+                }),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::Identifier(Ident::new("enabled"))),
+        },
+        projection_expr("SELECT x NOT BETWEEN SYMMETRIC a + 1 AND b * 2 AND enabled FROM t")
+    );
+
+    // A leading NOT negates the whole range comparison; the OR stays outside.
+    assert_eq!(
+        Expr::BinaryOp {
+            left: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: Box::new(Expr::BetweenAsymmetric {
+                    expr: Box::new(Expr::Identifier(Ident::new("x"))),
+                    negated: false,
+                    low: Box::new(Expr::Identifier(Ident::new("a"))),
+                    high: Box::new(Expr::Identifier(Ident::new("b"))),
+                }),
+            }),
+            op: BinaryOperator::Or,
+            right: Box::new(Expr::Identifier(Ident::new("enabled"))),
+        },
+        projection_expr("SELECT NOT x BETWEEN ASYMMETRIC a AND b OR enabled FROM t")
+    );
+}
+
+#[test]
+fn parse_between_symmetric_complex_bounds() {
+    // Function calls, arithmetic, and parenthesized expressions are allowed
+    // in the bounds; an AND inside parentheses does not separate the bounds.
+    let select = pg_and_generic()
+        .verified_only_select("SELECT x BETWEEN SYMMETRIC (a AND b) AND g(c, 1 + 2) FROM t");
+    let Expr::BetweenSymmetric {
+        expr,
+        negated,
+        low,
+        high,
+    } = expr_from_projection(&select.projection[0]).clone()
+    else {
+        panic!("expected BETWEEN SYMMETRIC")
+    };
+    assert_eq!(Expr::Identifier(Ident::new("x")), *expr);
+    assert!(!negated);
+    assert_eq!(
+        Expr::Nested(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("a"))),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::Identifier(Ident::new("b"))),
+        })),
+        *low
+    );
+    assert!(matches!(*high, Expr::Function(_)));
+}
+
+#[test]
+fn parse_between_symmetric_errors() {
+    // Two consecutive modifiers are rejected.
+    for sql in [
+        "SELECT x BETWEEN SYMMETRIC ASYMMETRIC 1 AND 2 FROM t",
+        "SELECT x BETWEEN SYMMETRIC SYMMETRIC 1 AND 2 FROM t",
+        "SELECT x BETWEEN ASYMMETRIC SYMMETRIC 1 AND 2 FROM t",
+        "SELECT x BETWEEN ASYMMETRIC ASYMMETRIC 1 AND 2 FROM t",
+    ] {
+        assert!(
+            pg_and_generic().parse_sql_statements(sql).is_err(),
+            "expected error for {sql}"
+        );
+    }
+    assert_eq!(
+        pg_and_generic()
+            .parse_sql_statements("SELECT x BETWEEN SYMMETRIC ASYMMETRIC 1 AND 2 FROM t")
+            .unwrap_err(),
+        ParserError::ParserError("Expected: an expression, found: ASYMMETRIC".to_string())
+    );
+
+    // Missing lower bound, separating AND, or upper bound are errors.
+    for sql in [
+        "SELECT x BETWEEN SYMMETRIC AND 2 FROM t",
+        "SELECT x BETWEEN ASYMMETRIC AND 2 FROM t",
+        "SELECT x BETWEEN SYMMETRIC 1 FROM t",
+        "SELECT x BETWEEN SYMMETRIC 1 AND",
+        "SELECT x BETWEEN SYMMETRIC",
+    ] {
+        assert!(
+            pg_and_generic().parse_sql_statements(sql).is_err(),
+            "expected error for {sql}"
+        );
+    }
+}
+
+#[test]
+fn parse_between_quoted_symmetric_identifier() {
+    // A quoted "symmetric"/"asymmetric" after BETWEEN is the lower bound
+    // identifier, not the modifier.
+    let select =
+        pg_and_generic().verified_only_select(r#"SELECT x BETWEEN "symmetric" AND 5 FROM t"#);
+    assert_eq!(
+        &Expr::Between {
+            expr: Box::new(Expr::Identifier(Ident::new("x"))),
+            negated: false,
+            low: Box::new(Expr::Identifier(Ident::with_quote('"', "symmetric"))),
+            high: Box::new(Expr::value(number("5"))),
+        },
+        expr_from_projection(&select.projection[0])
+    );
+
+    let select =
+        pg_and_generic().verified_only_select(r#"SELECT x BETWEEN "ASYMMETRIC" AND 5 FROM t"#);
+    assert!(matches!(
+        expr_from_projection(&select.projection[0]),
+        Expr::Between { negated: false, .. }
+    ));
+
+    // `symmetric`/`asymmetric` remain usable as plain column names.
+    pg_and_generic().verified_stmt("SELECT symmetric, asymmetric FROM t");
+}
+
+#[test]
+fn parse_between_symmetric_other_dialects() {
+    // Dialects without BETWEEN modifier support keep treating
+    // `symmetric`/`asymmetric` as regular identifiers.
+    let dialects = all_dialects_where(|d| !d.supports_between_symmetric());
+    let select = dialects.verified_only_select("SELECT x BETWEEN symmetric AND 5 FROM t");
+    assert_eq!(
+        &Expr::Between {
+            expr: Box::new(Expr::Identifier(Ident::new("x"))),
+            negated: false,
+            low: Box::new(Expr::Identifier(Ident::new("symmetric"))),
+            high: Box::new(Expr::value(number("5"))),
+        },
+        expr_from_projection(&select.projection[0])
+    );
+    let select = dialects.verified_only_select("SELECT x BETWEEN asymmetric AND 5 FROM t");
+    assert!(matches!(
+        expr_from_projection(&select.projection[0]),
+        Expr::Between { negated: false, .. }
+    ));
+}
+
+#[test]
+#[cfg(all(feature = "serde", feature = "serde_json"))]
+fn between_symmetric_serde_round_trip() {
+    for sql in [
+        "SELECT x BETWEEN 1 AND 2 FROM t",
+        "SELECT x NOT BETWEEN 1 AND 2 FROM t",
+        "SELECT x BETWEEN ASYMMETRIC 1 AND 2 FROM t",
+        "SELECT x BETWEEN SYMMETRIC 1 AND 2 FROM t",
+        "SELECT x NOT BETWEEN SYMMETRIC 1 AND 2 FROM t",
+    ] {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let json = serde_json::to_string(&ast).unwrap();
+        let deserialized: Vec<Statement> = serde_json::from_str(&json).unwrap();
+        assert_eq!(ast, deserialized, "serde round trip failed for {sql}");
+    }
+
+    // The three forms serialize differently.
+    let json_of = |sql: &str| {
+        let ast = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        serde_json::to_string(&ast).unwrap()
+    };
+    let plain = json_of("SELECT x BETWEEN 1 AND 2 FROM t");
+    let asymmetric = json_of("SELECT x BETWEEN ASYMMETRIC 1 AND 2 FROM t");
+    let symmetric = json_of("SELECT x BETWEEN SYMMETRIC 1 AND 2 FROM t");
+    assert_ne!(plain, asymmetric);
+    assert_ne!(plain, symmetric);
+    assert_ne!(asymmetric, symmetric);
+}
+
+#[test]
+#[cfg(feature = "visitor")]
+fn between_symmetric_visitor() {
+    use sqlparser::ast::{visit_expressions, visit_expressions_mut};
+
+    // The compared expression and both bounds are visited.
+    let stmt = pg_and_generic().verified_stmt("SELECT x BETWEEN SYMMETRIC 1 AND 2 FROM t");
+    let mut visited = vec![];
+    let _ = visit_expressions(&stmt, |expr| {
+        visited.push(expr.to_string());
+        core::ops::ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(visited, ["x BETWEEN SYMMETRIC 1 AND 2", "x", "1", "2"]);
+
+    // ... and can be modified, as with a plain BETWEEN.
+    let mut stmt = pg_and_generic().verified_stmt("SELECT x NOT BETWEEN ASYMMETRIC 1 AND 2 FROM t");
+    let _ = visit_expressions_mut(&mut stmt, |expr| {
+        if matches!(expr, Expr::Value(_)) {
+            *expr = Expr::value(number("42"));
+        }
+        core::ops::ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(
+        stmt.to_string(),
+        "SELECT x NOT BETWEEN ASYMMETRIC 42 AND 42 FROM t"
+    );
+}

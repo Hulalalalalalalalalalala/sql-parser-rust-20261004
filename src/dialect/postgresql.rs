@@ -368,4 +368,8 @@ impl Dialect for PostgreSqlDialect {
     fn supports_comment_optimizer_hint(&self) -> bool {
         true
     }
+
+    fn supports_between_symmetric(&self) -> bool {
+        true
+    }
 }

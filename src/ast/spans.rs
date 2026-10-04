@@ -1531,6 +1531,18 @@ impl Spanned for Expr {
                 negated: _,
                 low,
                 high,
+            }
+            | Expr::BetweenAsymmetric {
+                expr,
+                negated: _,
+                low,
+                high,
+            }
+            | Expr::BetweenSymmetric {
+                expr,
+                negated: _,
+                low,
+                high,
             } => expr.span().union(&low.span()).union(&high.span()),
 
             Expr::BinaryOp { left, op: _, right } => left.span().union(&right.span()),

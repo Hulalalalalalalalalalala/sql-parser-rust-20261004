@@ -4547,18 +4547,63 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses `BETWEEN <low> AND <high>`, assuming the `BETWEEN` keyword was already consumed.
+    /// Parses `BETWEEN [ ASYMMETRIC | SYMMETRIC ] <low> AND <high>`, assuming
+    /// the `BETWEEN` keyword was already consumed.
     pub fn parse_between(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParserError> {
+        /// Which `BETWEEN` modifier, if any, was specified.
+        enum BetweenModifier {
+            Asymmetric,
+            Symmetric,
+        }
+
+        // In dialects that support them, an optional `ASYMMETRIC` or
+        // `SYMMETRIC` modifier may appear between `BETWEEN` and the lower
+        // bound. An unquoted word matching either keyword in this position is
+        // always treated as the modifier; quote it to use it as the lower
+        // bound identifier instead.
+        let modifier = if self.dialect.supports_between_symmetric() {
+            if self.parse_keyword(Keyword::ASYMMETRIC) {
+                Some(BetweenModifier::Asymmetric)
+            } else if self.parse_keyword(Keyword::SYMMETRIC) {
+                Some(BetweenModifier::Symmetric)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if modifier.is_some()
+            && (self.peek_keyword(Keyword::ASYMMETRIC) || self.peek_keyword(Keyword::SYMMETRIC))
+        {
+            // Only a single modifier is allowed, e.g. reject
+            // `BETWEEN SYMMETRIC ASYMMETRIC <low> AND <high>`.
+            return self.expected_ref("an expression", self.peek_token_ref());
+        }
         // Stop parsing subexpressions for <low> and <high> on tokens with
         // precedence lower than that of `BETWEEN`, such as `AND`, `IS`, etc.
         let low = self.parse_subexpr(self.dialect.prec_value(Precedence::Between))?;
         self.expect_keyword_is(Keyword::AND)?;
         let high = self.parse_subexpr(self.dialect.prec_value(Precedence::Between))?;
-        Ok(Expr::Between {
-            expr: Box::new(expr),
-            negated,
-            low: Box::new(low),
-            high: Box::new(high),
+        let (expr, low, high) = (Box::new(expr), Box::new(low), Box::new(high));
+        Ok(match modifier {
+            None => Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            },
+            Some(BetweenModifier::Asymmetric) => Expr::BetweenAsymmetric {
+                expr,
+                negated,
+                low,
+                high,
+            },
+            Some(BetweenModifier::Symmetric) => Expr::BetweenSymmetric {
+                expr,
+                negated,
+                low,
+                high,
+            },
         })
     }
 

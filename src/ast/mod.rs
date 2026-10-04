@@ -1013,6 +1013,31 @@ pub enum Expr {
         /// Upper bound.
         high: Box<Expr>,
     },
+    /// `<expr> [ NOT ] BETWEEN ASYMMETRIC <low> AND <high>`
+    ///
+    /// This is distinct from [`Expr::Between`], which represents `BETWEEN`
+    /// without any modifier (or with the modifier omitted).
+    BetweenAsymmetric {
+        /// Expression being compared.
+        expr: Box<Expr>,
+        /// `true` when the `NOT` modifier is present.
+        negated: bool,
+        /// Lower bound.
+        low: Box<Expr>,
+        /// Upper bound.
+        high: Box<Expr>,
+    },
+    /// `<expr> [ NOT ] BETWEEN SYMMETRIC <low> AND <high>`
+    BetweenSymmetric {
+        /// Expression being compared.
+        expr: Box<Expr>,
+        /// `true` when the `NOT` modifier is present.
+        negated: bool,
+        /// Lower bound.
+        low: Box<Expr>,
+        /// Upper bound.
+        high: Box<Expr>,
+    },
     /// Binary operation e.g. `1 + 1` or `foo > bar`
     BinaryOp {
         /// Left operand.
@@ -1851,6 +1876,32 @@ impl fmt::Display for Expr {
             } => write!(
                 f,
                 "{} {}BETWEEN {} AND {}",
+                expr,
+                if *negated { "NOT " } else { "" },
+                low,
+                high
+            ),
+            Expr::BetweenAsymmetric {
+                expr,
+                negated,
+                low,
+                high,
+            } => write!(
+                f,
+                "{} {}BETWEEN ASYMMETRIC {} AND {}",
+                expr,
+                if *negated { "NOT " } else { "" },
+                low,
+                high
+            ),
+            Expr::BetweenSymmetric {
+                expr,
+                negated,
+                low,
+                high,
+            } => write!(
+                f,
+                "{} {}BETWEEN SYMMETRIC {} AND {}",
                 expr,
                 if *negated { "NOT " } else { "" },
                 low,
