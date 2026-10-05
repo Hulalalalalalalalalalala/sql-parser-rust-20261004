@@ -6144,6 +6144,135 @@ fn parse_named_window_functions() {
 }
 
 #[test]
+fn parse_window_frame_exclusion() {
+    let supported_dialects = TestedDialects::new(vec![
+        Box::new(GenericDialect {}),
+        Box::new(PostgreSqlDialect {}),
+        Box::new(SQLiteDialect {}),
+    ]);
+
+    // All four exclusion options, with the single-bound shorthand and the
+    // `BETWEEN .. AND` form, for all three frame units.
+    supported_dialects
+        .verified_stmt("SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE CURRENT ROW) FROM t");
+    supported_dialects.verified_stmt(
+        "SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM t",
+    );
+    supported_dialects.verified_stmt(
+        "SELECT sum(x) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t",
+    );
+    supported_dialects
+        .verified_stmt("SELECT sum(x) OVER (GROUPS UNBOUNDED PRECEDING EXCLUDE NO OTHERS) FROM t");
+    supported_dialects.verified_stmt(
+        "SELECT sum(x) OVER (GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE NO OTHERS) FROM t",
+    );
+
+    // Bounds may be arbitrary expressions, including INTERVAL literals.
+    supported_dialects.verified_stmt(
+        "SELECT sum(x) OVER (ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t",
+    );
+    supported_dialects.verified_stmt(
+        "SELECT sum(x) OVER (ORDER BY a RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND INTERVAL '1' DAY FOLLOWING EXCLUDE GROUP) FROM t",
+    );
+
+    // The exclusion belongs to the frame of the window it is defined in,
+    // both in `OVER (...)` and in a named `WINDOW` clause definition; a
+    // named window reference (`OVER w`) is preserved as-is.
+    supported_dialects.verified_stmt(
+        "SELECT sum(x) OVER w, sum(y) OVER (ROWS 1 PRECEDING EXCLUDE GROUP) FROM t \
+         WINDOW w AS (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES)",
+    );
+
+    // Each window keeps its own exclusion option.
+    let select = supported_dialects.verified_only_select(
+        "SELECT \
+         sum(x) OVER (ROWS 1 PRECEDING EXCLUDE CURRENT ROW), \
+         sum(y) OVER (ROWS 1 PRECEDING EXCLUDE NO OTHERS), \
+         sum(z) OVER (ROWS 1 PRECEDING) \
+         FROM t",
+    );
+    let exclusion_of = |i: usize| -> Option<WindowFrameExclusion> {
+        match expr_from_projection(&select.projection[i]) {
+            Expr::Function(Function {
+                over:
+                    Some(WindowType::WindowSpec(WindowSpec {
+                        window_frame: Some(window_frame),
+                        ..
+                    })),
+                ..
+            }) => window_frame.exclude,
+            _ => panic!("expected a window function with a frame"),
+        }
+    };
+    assert_eq!(Some(WindowFrameExclusion::CurrentRow), exclusion_of(0));
+    // `EXCLUDE NO OTHERS` is preserved and distinct from no `EXCLUDE` clause.
+    assert_eq!(Some(WindowFrameExclusion::NoOthers), exclusion_of(1));
+    assert_eq!(None, exclusion_of(2));
+
+    // `EXCLUDE` is not supported by dialects without window frame exclusion.
+    let unsupported_dialects = TestedDialects::new(vec![
+        Box::new(MySqlDialect {}),
+        Box::new(MsSqlDialect {}),
+        Box::new(AnsiDialect {}),
+    ]);
+    let res = unsupported_dialects
+        .parse_sql_statements("SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE CURRENT ROW) FROM t");
+    assert!(res.is_err());
+
+    // `EXCLUDE` without a frame.
+    let res =
+        supported_dialects.parse_sql_statements("SELECT sum(x) OVER (EXCLUDE CURRENT ROW) FROM t");
+    assert_eq!(
+        ParserError::ParserError("Expected: ROWS, RANGE, GROUPS, found: EXCLUDE".to_string()),
+        res.unwrap_err()
+    );
+
+    // `EXCLUDE` between the bounds of a `BETWEEN .. AND` frame.
+    let res = supported_dialects.parse_sql_statements(
+        "SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING EXCLUDE TIES AND 1 FOLLOWING) FROM t",
+    );
+    assert_eq!(
+        ParserError::ParserError("Expected: AND, found: EXCLUDE".to_string()),
+        res.unwrap_err()
+    );
+
+    // Missing `ROW` after `EXCLUDE CURRENT`.
+    let res = supported_dialects
+        .parse_sql_statements("SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE CURRENT) FROM t");
+    assert_eq!(
+        ParserError::ParserError("Expected: ROW, found: )".to_string()),
+        res.unwrap_err()
+    );
+
+    // Missing `OTHERS` after `EXCLUDE NO`.
+    let res = supported_dialects
+        .parse_sql_statements("SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE NO) FROM t");
+    assert_eq!(
+        ParserError::ParserError("Expected: OTHERS, found: )".to_string()),
+        res.unwrap_err()
+    );
+
+    // Unknown exclusion option.
+    let res = supported_dialects
+        .parse_sql_statements("SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE EVERYTHING) FROM t");
+    assert_eq!(
+        ParserError::ParserError(
+            "Expected: CURRENT ROW, GROUP, TIES, or NO OTHERS, found: EVERYTHING".to_string()
+        ),
+        res.unwrap_err()
+    );
+
+    // `EXCLUDE` may appear only once; the error points at the second one.
+    let res = supported_dialects.parse_sql_statements(
+        "SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE TIES EXCLUDE GROUP) FROM t",
+    );
+    assert_eq!(
+        ParserError::ParserError("Expected: ), found: EXCLUDE".to_string()),
+        res.unwrap_err()
+    );
+}
+
+#[test]
 fn parse_window_clause() {
     let dialects = all_dialects_except(|d| d.is_table_alias(&Keyword::WINDOW, &mut Parser::new(d)));
     let sql = "SELECT * \

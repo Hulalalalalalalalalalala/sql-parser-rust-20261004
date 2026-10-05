@@ -2455,6 +2455,9 @@ impl fmt::Display for WindowSpec {
             } else {
                 write!(f, "{} {}", window_frame.units, window_frame.start_bound)?;
             }
+            if let Some(exclude) = &window_frame.exclude {
+                write!(f, " EXCLUDE {exclude}")?;
+            }
         }
         Ok(())
     }
@@ -2477,7 +2480,20 @@ pub struct WindowFrame {
     /// indicates the shorthand form (e.g. `ROWS 1 PRECEDING`), which must
     /// behave the same as `end_bound = WindowFrameBound::CurrentRow`.
     pub end_bound: Option<WindowFrameBound>,
-    // TBD: EXCLUDE
+    /// Optional frame exclusion, e.g. `EXCLUDE CURRENT ROW`.
+    ///
+    /// `None` indicates that no `EXCLUDE` clause was specified, which is
+    /// distinct from an explicit `EXCLUDE NO OTHERS`.
+    ///
+    /// You can find it at least in [PostgreSQL][1], [SQLite][2]
+    ///
+    /// [1]: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS
+    /// [2]: https://www.sqlite.org/windowfunctions.html#frame_specifications
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub exclude: Option<WindowFrameExclusion>,
 }
 
 impl Default for WindowFrame {
@@ -2489,7 +2505,36 @@ impl Default for WindowFrame {
             units: WindowFrameUnits::Range,
             start_bound: WindowFrameBound::Preceding(None),
             end_bound: None,
+            exclude: None,
         }
+    }
+}
+
+/// Specifies which rows around the current row are excluded from the window
+/// frame, e.g. `EXCLUDE TIES` in
+/// `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES`.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum WindowFrameExclusion {
+    /// `EXCLUDE CURRENT ROW`
+    CurrentRow,
+    /// `EXCLUDE GROUP`
+    Group,
+    /// `EXCLUDE TIES`
+    Ties,
+    /// `EXCLUDE NO OTHERS`
+    NoOthers,
+}
+
+impl fmt::Display for WindowFrameExclusion {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            WindowFrameExclusion::CurrentRow => "CURRENT ROW",
+            WindowFrameExclusion::Group => "GROUP",
+            WindowFrameExclusion::Ties => "TIES",
+            WindowFrameExclusion::NoOthers => "NO OTHERS",
+        })
     }
 }
 

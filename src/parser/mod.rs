@@ -2758,7 +2758,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a `WINDOW` frame definition (units and bounds).
+    /// Parse a `WINDOW` frame definition (units, bounds, and optional
+    /// frame exclusion).
     pub fn parse_window_frame(&mut self) -> Result<WindowFrame, ParserError> {
         let units = self.parse_window_frame_units()?;
         let (start_bound, end_bound) = if self.parse_keyword(Keyword::BETWEEN) {
@@ -2769,11 +2770,41 @@ impl<'a> Parser<'a> {
         } else {
             (self.parse_window_frame_bound()?, None)
         };
+        let exclude = if self.dialect.supports_window_frame_exclusion()
+            && self.parse_keyword(Keyword::EXCLUDE)
+        {
+            Some(self.parse_window_frame_exclusion()?)
+        } else {
+            None
+        };
         Ok(WindowFrame {
             units,
             start_bound,
             end_bound,
+            exclude,
         })
+    }
+
+    /// Parse a window frame exclusion clause: `CURRENT ROW`, `GROUP`,
+    /// `TIES`, or `NO OTHERS`. The `EXCLUDE` keyword has already been
+    /// consumed by the caller.
+    pub fn parse_window_frame_exclusion(&mut self) -> Result<WindowFrameExclusion, ParserError> {
+        if self.parse_keyword(Keyword::CURRENT) {
+            self.expect_keyword_is(Keyword::ROW)?;
+            Ok(WindowFrameExclusion::CurrentRow)
+        } else if self.parse_keyword(Keyword::GROUP) {
+            Ok(WindowFrameExclusion::Group)
+        } else if self.parse_keyword(Keyword::TIES) {
+            Ok(WindowFrameExclusion::Ties)
+        } else if self.parse_keyword(Keyword::NO) {
+            self.expect_keyword_is(Keyword::OTHERS)?;
+            Ok(WindowFrameExclusion::NoOthers)
+        } else {
+            self.expected_ref(
+                "CURRENT ROW, GROUP, TIES, or NO OTHERS",
+                self.peek_token_ref(),
+            )
+        }
     }
 
     /// Parse a window frame bound: `CURRENT ROW` or `<n> PRECEDING|FOLLOWING`.

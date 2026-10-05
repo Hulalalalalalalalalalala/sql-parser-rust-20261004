@@ -174,6 +174,46 @@ FROM
 }
 
 #[test]
+fn test_pretty_print_window_frame_exclusion() {
+    let sql = "SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES) FROM t";
+    let pretty = prettify(sql);
+    assert_eq!(
+        pretty,
+        r#"
+SELECT
+  sum(x) OVER (
+    ORDER BY y
+    ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES
+  )
+FROM
+  t
+"#
+        .trim()
+    );
+    // The pretty-printed output re-parses to the same statement.
+    let ast = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+    let reparsed = Parser::parse_sql(&GenericDialect {}, &pretty).unwrap();
+    assert_eq!(ast, reparsed);
+
+    // `EXCLUDE NO OTHERS` remains distinguishable from no `EXCLUDE` clause.
+    let with_exclude = Parser::parse_sql(
+        &GenericDialect {},
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE NO OTHERS) FROM t",
+    )
+    .unwrap();
+    let without_exclude = Parser::parse_sql(
+        &GenericDialect {},
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING) FROM t",
+    )
+    .unwrap();
+    assert_ne!(with_exclude, without_exclude);
+    assert_ne!(
+        prettify("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE NO OTHERS) FROM t"),
+        prettify("SELECT sum(x) OVER (ROWS 1 PRECEDING) FROM t")
+    );
+}
+
+#[test]
 fn test_pretty_print_multiline_string() {
     assert_eq!(
         prettify("SELECT 'multiline\nstring' AS str"),
