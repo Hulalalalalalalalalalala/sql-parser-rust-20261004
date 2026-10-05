@@ -160,10 +160,11 @@ pub enum Value {
     /// See [Postgres docs](https://www.postgresql.org/docs/8.3/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS)
     /// for more details.
     EscapedStringLiteral(String),
-    /// u&'string value' (postgres extension)
+    /// u&'string value' (postgres extension), optionally with a custom
+    /// escape character: `U&'!0061' UESCAPE '!'`
     /// See [Postgres docs](https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS-UESCAPE)
     /// for more details.
-    UnicodeStringLiteral(String),
+    UnicodeStringLiteral(UnicodeStringLiteral),
     /// B'string value'
     SingleQuotedByteStringLiteral(String),
     /// B"string value"
@@ -231,9 +232,9 @@ impl Value {
             | Value::TripleSingleQuotedRawStringLiteral(s)
             | Value::TripleDoubleQuotedRawStringLiteral(s)
             | Value::EscapedStringLiteral(s)
-            | Value::UnicodeStringLiteral(s)
             | Value::NationalStringLiteral(s)
             | Value::HexStringLiteral(s) => Some(s),
+            Value::UnicodeStringLiteral(s) => Some(s.value),
             Value::DollarQuotedString(s) => Some(s.value),
             Value::QuoteDelimitedStringLiteral(s) => Some(s.value),
             Value::NationalQuoteDelimitedStringLiteral(s) => Some(s.value),
@@ -272,7 +273,7 @@ impl fmt::Display for Value {
             }
             Value::DollarQuotedString(v) => write!(f, "{v}"),
             Value::EscapedStringLiteral(v) => write!(f, "E'{}'", escape_escaped_string(v)),
-            Value::UnicodeStringLiteral(v) => write!(f, "U&'{}'", escape_unicode_string(v)),
+            Value::UnicodeStringLiteral(v) => write!(f, "{v}"),
             Value::NationalStringLiteral(v) => write!(f, "N'{}'", escape_single_quote_string(v)),
             Value::QuoteDelimitedStringLiteral(v) => v.fmt(f),
             Value::NationalQuoteDelimitedStringLiteral(v) => write!(f, "N{v}"),
@@ -297,6 +298,95 @@ impl fmt::Display for Value {
             Value::Null => write!(f, "NULL"),
             Value::Placeholder(v) => write!(f, "{v}"),
         }
+    }
+}
+
+/// A Unicode string literal, e.g. `U&'\0441\043B\043E\043D'`, optionally
+/// with a custom escape character selected via a `UESCAPE '<char>'` clause,
+/// e.g. `U&'!0041' UESCAPE '!'`.
+///
+/// See [Postgres docs](https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS-UESCAPE)
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct UnicodeStringLiteral {
+    /// The decoded string value.
+    pub value: String,
+    /// The escape character explicitly selected with a `UESCAPE '<char>'`
+    /// clause, or `None` if no clause was specified (in which case the
+    /// escape character defaults to `\`).
+    pub escape: Option<char>,
+}
+
+impl UnicodeStringLiteral {
+    /// Create a Unicode string literal without an explicit `UESCAPE` clause.
+    pub fn new(value: impl Into<String>) -> Self {
+        UnicodeStringLiteral {
+            value: value.into(),
+            escape: None,
+        }
+    }
+
+    /// Create a Unicode string literal with an explicit escape character,
+    /// as selected by a `UESCAPE '<char>'` clause.
+    pub fn with_escape(value: impl Into<String>, escape: char) -> Self {
+        UnicodeStringLiteral {
+            value: value.into(),
+            escape: Some(escape),
+        }
+    }
+}
+
+impl fmt::Display for UnicodeStringLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let escape = self.escape.unwrap_or('\\');
+        write!(f, "U&'{}'", escape_unicode_string(&self.value, escape))?;
+        if let Some(escape) = self.escape {
+            write!(f, " UESCAPE '{escape}'")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for UnicodeStringLiteral {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // For compatibility with the serialization format used before the
+        // `UESCAPE` clause was supported, literals without an explicit
+        // escape character serialize as a plain string.
+        match self.escape {
+            Some(escape) => {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("UnicodeStringLiteral", 2)?;
+                state.serialize_field("value", &self.value)?;
+                state.serialize_field("escape", &escape)?;
+                state.end()
+            }
+            None => serializer.serialize_str(&self.value),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for UnicodeStringLiteral {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            /// The legacy format: a plain string without escape information.
+            Legacy(String),
+            /// A literal with an explicit `UESCAPE` escape character.
+            WithEscape { value: String, escape: char },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Legacy(value) => UnicodeStringLiteral::new(value),
+            Repr::WithEscape { value, escape } => UnicodeStringLiteral::with_escape(value, escape),
+        })
     }
 }
 
@@ -654,29 +744,35 @@ pub fn escape_escaped_string(s: &str) -> EscapeEscapedStringLiteral<'_> {
     EscapeEscapedStringLiteral(s)
 }
 
-pub struct EscapeUnicodeStringLiteral<'a>(&'a str);
+pub struct EscapeUnicodeStringLiteral<'a> {
+    string: &'a str,
+    escape: char,
+}
 
 impl fmt::Display for EscapeUnicodeStringLiteral<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for c in self.0.chars() {
+        let escape = self.escape;
+        for c in self.string.chars() {
             match c {
                 '\'' => {
                     write!(f, "''")?;
                 }
-                '\\' => {
-                    write!(f, r#"\\"#)?;
+                // Two consecutive escape characters represent the escape
+                // character itself.
+                c if c == escape => {
+                    write!(f, "{escape}{escape}")?;
                 }
                 x if x.is_ascii() => {
                     write!(f, "{c}")?;
                 }
                 _ => {
                     let codepoint = c as u32;
-                    // if the character fits in 32 bits, we can use the \XXXX format
-                    // otherwise, we need to use the \+XXXXXX format
+                    // if the character fits in 32 bits, we can use the <escape>XXXX format
+                    // otherwise, we need to use the <escape>+XXXXXX format
                     if codepoint <= 0xFFFF {
-                        write!(f, "\\{codepoint:04X}")?;
+                        write!(f, "{escape}{codepoint:04X}")?;
                     } else {
-                        write!(f, "\\+{codepoint:06X}")?;
+                        write!(f, "{escape}+{codepoint:06X}")?;
                     }
                 }
             }
@@ -685,10 +781,10 @@ impl fmt::Display for EscapeUnicodeStringLiteral<'_> {
     }
 }
 
-/// Return a helper which escapes non-ASCII characters using `\XXXX` or
-/// `\+XXXXXX` Unicode escape formats (used for `U&'...'` style literals).
-pub fn escape_unicode_string(s: &str) -> EscapeUnicodeStringLiteral<'_> {
-    EscapeUnicodeStringLiteral(s)
+/// Return a helper which escapes non-ASCII characters using `<escape>XXXX` or
+/// `<escape>+XXXXXX` Unicode escape formats (used for `U&'...'` style literals).
+pub fn escape_unicode_string(s: &str, escape: char) -> EscapeUnicodeStringLiteral<'_> {
+    EscapeUnicodeStringLiteral { string: s, escape }
 }
 
 /// The side on which `TRIM` should be applied.

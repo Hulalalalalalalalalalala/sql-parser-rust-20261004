@@ -319,12 +319,15 @@ pub trait Dialect: Debug + Any {
     }
 
     /// Determine if the dialect supports string literals with `U&` prefix.
-    /// This is used to specify Unicode code points in string literals.
-    /// For example, in PostgreSQL, the following is a valid string literal:
+    /// This is used to specify Unicode code points in string literals, using
+    /// `\XXXX`/`\+XXXXXX` escapes by default, or a custom escape character
+    /// selected via a trailing `UESCAPE '<char>'` clause.
+    /// For example, in PostgreSQL, the following are valid string literals:
     /// ```sql
     /// SELECT U&'\0061\0062\0063';
+    /// SELECT U&'!0061!0062!0063' UESCAPE '!';
     /// ```
-    /// This is equivalent to the string literal `'abc'`.
+    /// These are equivalent to the string literal `'abc'`.
     /// See
     ///  - [Postgres docs](https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS-UESCAPE)
     ///  - [H2 docs](http://www.h2database.com/html/grammar.html#string)
