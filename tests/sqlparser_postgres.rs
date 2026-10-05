@@ -7565,11 +7565,252 @@ fn test_unicode_string_literal() {
                 value: Value::UnicodeStringLiteral(s),
                 span: _,
             }) => {
-                assert_eq!(expected, s);
+                assert_eq!(expected, s.value);
+                assert_eq!(None, s.escape);
             }
             _ => unreachable!(),
         }
     }
+}
+
+#[test]
+fn test_unicode_string_literal_uescape() {
+    // A custom escape character can be selected with a UESCAPE clause, see
+    // the examples from the postgres docs
+    match pg_and_generic().expr_parses_to(
+        r#"U&'d!0061t!+000061' UESCAPE '!'"#,
+        r#"U&'data' UESCAPE '!'"#,
+    ) {
+        Expr::Value(ValueWithSpan {
+            value: Value::UnicodeStringLiteral(s),
+            span: _,
+        }) => {
+            assert_eq!("data", s.value);
+            assert_eq!(Some('!'), s.escape);
+        }
+        _ => unreachable!(),
+    }
+
+    // The UESCAPE clause is preserved when generating SQL, and the custom
+    // escape character is used to escape the contents
+    pg_and_generic().one_statement_parses_to(
+        r#"SELECT U&'!0061!+01F418!!' UESCAPE '!' AS v"#,
+        r#"SELECT U&'a!+01F418!!' UESCAPE '!' AS v"#,
+    );
+
+    // The escape character itself is escaped by doubling it
+    match pg_and_generic().expr_parses_to(
+        r#"U&'!0061!+01F418!!' UESCAPE '!'"#,
+        r#"U&'a!+01F418!!' UESCAPE '!'"#,
+    ) {
+        Expr::Value(ValueWithSpan {
+            value: Value::UnicodeStringLiteral(s),
+            span: _,
+        }) => {
+            assert_eq!("a🐘!", s.value);
+            assert_eq!(Some('!'), s.escape);
+        }
+        _ => unreachable!(),
+    }
+
+    // With a custom escape character, a backslash is ordinary content
+    match pg_and_generic()
+        .expr_parses_to(r#"U&'\oops!0061' UESCAPE '!'"#, r#"U&'\oopsa' UESCAPE '!'"#)
+    {
+        Expr::Value(ValueWithSpan {
+            value: Value::UnicodeStringLiteral(s),
+            span: _,
+        }) => {
+            assert_eq!(r#"\oopsa"#, s.value);
+            assert_eq!(Some('!'), s.escape);
+        }
+        _ => unreachable!(),
+    }
+
+    // An explicitly selected backslash escape character still preserves the
+    // UESCAPE clause
+    pg_and_generic().one_statement_parses_to(
+        r#"SELECT U&'\0061' UESCAPE '\'"#,
+        r#"SELECT U&'a' UESCAPE '\'"#,
+    );
+
+    // The UESCAPE keyword is case-insensitive
+    pg_and_generic().one_statement_parses_to(
+        r#"SELECT U&'!0061' uescape '!'"#,
+        r#"SELECT U&'a' UESCAPE '!'"#,
+    );
+
+    // Whitespace, newlines and comments are allowed between the literal, the
+    // UESCAPE keyword and the character argument
+    pg_and_generic().expr_parses_to(
+        "U&'!0061' /* comment */\n UESCAPE -- another comment\n '!'",
+        r#"U&'a' UESCAPE '!'"#,
+    );
+
+    // Each literal in an expression selects its own escape character, and
+    // concatenation, commas and aliases parse as usual
+    pg_and_generic().one_statement_parses_to(
+        r#"SELECT U&'!0061' UESCAPE '!' || U&'\0062', U&'?0063' UESCAPE '?' AS v"#,
+        r#"SELECT U&'a' UESCAPE '!' || U&'b', U&'c' UESCAPE '?' AS v"#,
+    );
+
+    // UESCAPE can still be used as an identifier elsewhere
+    pg_and_generic().verified_stmt("SELECT 1 AS uescape");
+    pg_and_generic().verified_stmt("SELECT uescape FROM t");
+    pg_and_generic()
+        .one_statement_parses_to(r#"SELECT U&'\0061' AS uescape"#, "SELECT U&'a' AS uescape");
+}
+
+#[test]
+fn test_unicode_string_literal_uescape_span() {
+    // The span of the literal starts at the `U` and covers the closing quote
+    // of the character argument, but not a following alias
+    let cases = [
+        (
+            r#"SELECT U&'!0061' UESCAPE '!' AS v"#,
+            Span::new(Location::new(1, 8), Location::new(1, 29)),
+        ),
+        // Without a UESCAPE clause, the span covers only the literal
+        (
+            r#"SELECT U&'\0061' AS v"#,
+            Span::new(Location::new(1, 8), Location::new(1, 17)),
+        ),
+    ];
+    for (sql, expected_span) in cases {
+        for dialect in [&PostgreSqlDialect {} as &dyn Dialect, &GenericDialect {}] {
+            let ast = Parser::parse_sql(dialect, sql).unwrap();
+            match &ast[0] {
+                Statement::Query(query) => match query.body.as_ref() {
+                    SetExpr::Select(select) => match &select.projection[0] {
+                        SelectItem::ExprWithAlias { expr, alias } => {
+                            match expr {
+                                Expr::Value(value) => assert_eq!(expected_span, value.span),
+                                _ => unreachable!(),
+                            }
+                            assert_eq!("v", alias.value);
+                        }
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_unicode_string_literal_uescape_errors() {
+    let cases = [
+        // Empty character argument: error at the opening quote of the argument
+        (
+            "SELECT U&'a' UESCAPE ''",
+            "UESCAPE character must be exactly one character at Line: 1, Column: 22",
+        ),
+        // Multi-character argument
+        (
+            "SELECT U&'a' UESCAPE 'ab'",
+            "UESCAPE character must be exactly one character at Line: 1, Column: 22",
+        ),
+        // Forbidden characters: hex digits, +, quotes and whitespace
+        (
+            "SELECT U&'a' UESCAPE '5'",
+            "Invalid UESCAPE character: 5 at Line: 1, Column: 22",
+        ),
+        (
+            "SELECT U&'a' UESCAPE 'f'",
+            "Invalid UESCAPE character: f at Line: 1, Column: 22",
+        ),
+        (
+            "SELECT U&'a' UESCAPE '+'",
+            "Invalid UESCAPE character: + at Line: 1, Column: 22",
+        ),
+        (
+            "SELECT U&'a' UESCAPE ' '",
+            "Invalid UESCAPE character:   at Line: 1, Column: 22",
+        ),
+        // Missing argument: error at the end of the input
+        (
+            "SELECT U&'a' UESCAPE",
+            "Expected a single-quoted string after UESCAPE at Line: 1, Column: 21",
+        ),
+        // Non-string argument: error at the offending item
+        (
+            "SELECT U&'a' UESCAPE 5",
+            "Expected a single-quoted string after UESCAPE at Line: 1, Column: 22",
+        ),
+        (
+            r#"SELECT U&'a' UESCAPE "x""#,
+            "Expected a single-quoted string after UESCAPE at Line: 1, Column: 22",
+        ),
+        // A second UESCAPE clause for the same literal is an error, reported
+        // at the second UESCAPE
+        (
+            "SELECT U&'a' UESCAPE '!' UESCAPE '?'",
+            "Duplicate UESCAPE clause at Line: 1, Column: 26",
+        ),
+        // Too few hex digits: error at the start of the escape sequence
+        (
+            "SELECT U&'!0' UESCAPE '!'",
+            "Unexpected EOF while parsing hex digit in escaped unicode string. at Line: 1, Column: 11",
+        ),
+        // Invalid hex digit: error at the start of the escape sequence
+        (
+            "SELECT U&'!0zz' UESCAPE '!'",
+            "Invalid hex digit in escaped unicode string: z at Line: 1, Column: 11",
+        ),
+        // Invalid unicode code point (a surrogate)
+        (
+            r"SELECT U&'\D800'",
+            "Invalid unicode character: d800 at Line: 1, Column: 11",
+        ),
+        // Escape sequence errors are reported at the location of the escape
+        // character in the original SQL, across lines and non-ASCII content
+        (
+            "SELECT U&'中!0061\n!zz' UESCAPE '!'",
+            "Invalid hex digit in escaped unicode string: z at Line: 2, Column: 1",
+        ),
+    ];
+    for (sql, expected) in cases {
+        for dialect in [&PostgreSqlDialect {} as &dyn Dialect, &GenericDialect {}] {
+            assert_eq!(
+                Parser::parse_sql(dialect, sql).unwrap_err().to_string(),
+                format!("sql parser error: {expected}"),
+                "unexpected error for {sql}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(all(feature = "serde", feature = "serde_json"))]
+fn test_unicode_string_literal_uescape_serde() {
+    // Literals without a UESCAPE clause keep the legacy serialization format
+    let value = Value::UnicodeStringLiteral(UnicodeStringLiteral::new("слон"));
+    assert_eq!(
+        serde_json::to_string(&value).unwrap(),
+        r#"{"UnicodeStringLiteral":"слон"}"#
+    );
+    // ... and the legacy format still deserializes
+    assert_eq!(
+        serde_json::from_str::<Value>(r#"{"UnicodeStringLiteral":"слон"}"#).unwrap(),
+        value,
+    );
+
+    // Literals with a UESCAPE clause survive a serde round trip and still
+    // generate SQL with the same syntax information
+    let ast = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        r#"SELECT U&'!0061!+01F418!!' UESCAPE '!' AS v"#,
+    )
+    .unwrap();
+    let json = serde_json::to_string(&ast).unwrap();
+    let deserialized: Vec<Statement> = serde_json::from_str(&json).unwrap();
+    assert_eq!(ast, deserialized);
+    assert_eq!(
+        deserialized[0].to_string(),
+        r#"SELECT U&'a!+01F418!!' UESCAPE '!' AS v"#
+    );
 }
 
 fn check_arrow_precedence(sql: &str, arrow_operator: BinaryOperator) {

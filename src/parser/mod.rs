@@ -12700,9 +12700,7 @@ impl<'a> Parser<'a> {
             Token::EscapedStringLiteral(ref s) => {
                 ok_value(Value::EscapedStringLiteral(s.to_string()))
             }
-            Token::UnicodeStringLiteral(ref s) => {
-                ok_value(Value::UnicodeStringLiteral(s.to_string()))
-            }
+            Token::UnicodeStringLiteral(ref s) => ok_value(Value::UnicodeStringLiteral(s.clone())),
             Token::HexStringLiteral(ref s) => ok_value(Value::HexStringLiteral(s.to_string())),
             Token::Placeholder(ref s) => ok_value(Value::Placeholder(s.to_string())),
             tok @ Token::Colon | tok @ Token::AtSign => {
@@ -12878,7 +12876,7 @@ impl<'a> Parser<'a> {
             Token::EscapedStringLiteral(s) if dialect_of!(self is PostgreSqlDialect | GenericDialect) => {
                 Ok(s)
             }
-            Token::UnicodeStringLiteral(s) => Ok(s),
+            Token::UnicodeStringLiteral(s) => Ok(s.value),
             _ => self.expected("literal string", next_token),
         }
     }
