@@ -59,6 +59,10 @@ impl Dialect for SQLiteDialect {
         true
     }
 
+    fn supports_window_frame_exclusion(&self) -> bool {
+        true
+    }
+
     fn is_identifier_part(&self, ch: char) -> bool {
         self.is_identifier_start(ch) || ch.is_ascii_digit()
     }

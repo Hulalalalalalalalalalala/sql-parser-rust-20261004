@@ -352,6 +352,20 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if the dialect supports the `EXCLUDE` clause of a window
+    /// frame, e.g.
+    /// ```sql
+    /// SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM t
+    /// ```
+    ///
+    /// Supported by [PostgreSQL] and [SQLite].
+    ///
+    /// [PostgreSQL]: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS
+    /// [SQLite]: https://www.sqlite.org/windowfunctions.html#frame_exclusions
+    fn supports_window_frame_exclusion(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports `ARRAY_AGG() [WITHIN GROUP (ORDER BY)]` expressions.
     /// Otherwise, the dialect should expect an `ORDER BY` without the `WITHIN GROUP` clause, e.g. [`ANSI`]
     ///

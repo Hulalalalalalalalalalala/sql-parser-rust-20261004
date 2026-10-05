@@ -1024,6 +1024,24 @@ fn parse_n_prefix_not_national_string() {
     all_dialects_where(|d| d.supports_national_string_literal()).verified_stmt("SELECT N'hello'");
 }
 
+#[test]
+fn parse_window_frame_exclude() {
+    // SQLite supports the window frame EXCLUDE clause.
+    // See https://www.sqlite.org/windowfunctions.html#frame_exclusions
+    sqlite_and_generic()
+        .verified_stmt("SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE CURRENT ROW) FROM t");
+    sqlite_and_generic().verified_stmt(
+        "SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM t",
+    );
+    sqlite_and_generic().verified_stmt(
+        "SELECT sum(x) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t",
+    );
+    sqlite_and_generic()
+        .verified_stmt("SELECT sum(x) OVER (GROUPS 1 PRECEDING EXCLUDE NO OTHERS) FROM t");
+    sqlite_and_generic()
+        .verified_stmt("SELECT sum(x) OVER w FROM t WINDOW w AS (ROWS 1 PRECEDING EXCLUDE TIES)");
+}
+
 fn sqlite() -> TestedDialects {
     TestedDialects::new(vec![Box::new(SQLiteDialect {})])
 }

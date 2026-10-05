@@ -2769,11 +2769,47 @@ impl<'a> Parser<'a> {
         } else {
             (self.parse_window_frame_bound()?, None)
         };
+        let exclude = self.parse_window_frame_exclusion()?;
         Ok(WindowFrame {
             units,
             start_bound,
             end_bound,
+            exclude,
         })
+    }
+
+    /// Parse an optional window frame `EXCLUDE` clause, e.g.
+    /// `EXCLUDE CURRENT ROW`, `EXCLUDE GROUP`, `EXCLUDE TIES`, or
+    /// `EXCLUDE NO OTHERS`.
+    ///
+    /// Returns `Ok(None)` if there is no `EXCLUDE` clause. Dialects that do
+    /// not support the clause ([Dialect::supports_window_frame_exclusion])
+    /// leave the `EXCLUDE` token unconsumed so that the caller reports a
+    /// syntax error.
+    ///
+    /// [Dialect::supports_window_frame_exclusion]: crate::dialect::Dialect::supports_window_frame_exclusion
+    pub fn parse_window_frame_exclusion(
+        &mut self,
+    ) -> Result<Option<WindowFrameExclusion>, ParserError> {
+        if !self.dialect.supports_window_frame_exclusion() || !self.parse_keyword(Keyword::EXCLUDE)
+        {
+            return Ok(None);
+        }
+        let exclusion = if self.parse_keywords(&[Keyword::CURRENT, Keyword::ROW]) {
+            WindowFrameExclusion::CurrentRow
+        } else if self.parse_keyword(Keyword::GROUP) {
+            WindowFrameExclusion::Group
+        } else if self.parse_keyword(Keyword::TIES) {
+            WindowFrameExclusion::Ties
+        } else if self.parse_keywords(&[Keyword::NO, Keyword::OTHERS]) {
+            WindowFrameExclusion::NoOthers
+        } else {
+            return self.expected_ref(
+                "CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE",
+                self.peek_token_ref(),
+            );
+        };
+        Ok(Some(exclusion))
     }
 
     /// Parse a window frame bound: `CURRENT ROW` or `<n> PRECEDING|FOLLOWING`.

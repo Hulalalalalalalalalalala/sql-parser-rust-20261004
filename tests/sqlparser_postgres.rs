@@ -11027,3 +11027,292 @@ fn between_symmetric_visitor() {
         "SELECT x NOT BETWEEN ASYMMETRIC 42 AND 42 FROM t"
     );
 }
+
+#[test]
+fn parse_window_frame_exclude() {
+    // All four exclusion options, in all three frame units, with both the
+    // single-bound shorthand and the `BETWEEN .. AND` form.
+    for units in ["ROWS", "RANGE", "GROUPS"] {
+        for (clause, exclusion) in [
+            ("EXCLUDE CURRENT ROW", WindowFrameExclusion::CurrentRow),
+            ("EXCLUDE GROUP", WindowFrameExclusion::Group),
+            ("EXCLUDE TIES", WindowFrameExclusion::Ties),
+            ("EXCLUDE NO OTHERS", WindowFrameExclusion::NoOthers),
+        ] {
+            for frame in [
+                format!("{units} 1 PRECEDING"),
+                format!("{units} BETWEEN 1 PRECEDING AND 1 FOLLOWING"),
+                format!("{units} BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"),
+            ] {
+                let sql = format!("SELECT sum(x) OVER ({frame} {clause}) FROM t");
+                let select = pg_and_generic().verified_only_select(&sql);
+                let frame = window_frame_of(&select);
+                assert_eq!(Some(exclusion), frame.exclude, "wrong exclusion for {sql}");
+            }
+        }
+    }
+
+    // The example from the task description.
+    pg_and_generic()
+        .verified_stmt("SELECT sum(x) OVER (ROWS CURRENT ROW EXCLUDE CURRENT ROW) FROM t");
+
+    // Bounds with arithmetic expressions, function calls and INTERVALs keep
+    // parsing as before, with the exclusion clause following them.
+    pg_and_generic().verified_stmt(
+        "SELECT sum(x) OVER (ROWS BETWEEN 1 + 2 PRECEDING AND abs(y) FOLLOWING EXCLUDE GROUP) FROM t",
+    );
+    pg().verified_stmt(
+        "SELECT sum(x) OVER (RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND INTERVAL '1' DAY FOLLOWING EXCLUDE TIES) FROM t",
+    );
+
+    // The exclusion clause is also accepted in a named window definition.
+    pg_and_generic().verified_stmt(
+        "SELECT sum(x) OVER w FROM t WINDOW w AS (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW)",
+    );
+}
+
+#[test]
+fn parse_window_frame_exclude_ast() {
+    // Without EXCLUDE, the frame has no exclusion.
+    let select =
+        pg_and_generic().verified_only_select("SELECT sum(x) OVER (ROWS 1 PRECEDING) FROM t");
+    let frame = window_frame_of(&select);
+    assert_eq!(
+        &WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start_bound: WindowFrameBound::Preceding(Some(Box::new(Expr::value(number("1"))))),
+            end_bound: None,
+            exclude: None,
+        },
+        frame
+    );
+
+    // `EXCLUDE NO OTHERS` is preserved in the AST, distinct from no clause.
+    let select = pg_and_generic()
+        .verified_only_select("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE NO OTHERS) FROM t");
+    let frame = window_frame_of(&select);
+    assert_eq!(Some(WindowFrameExclusion::NoOthers), frame.exclude);
+    assert_eq!(
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE NO OTHERS) FROM t",
+        select.to_string()
+    );
+
+    // Each window in a query keeps its own exclusion option.
+    let select = pg_and_generic().verified_only_select(
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES), \
+         sum(x) OVER (ROWS 1 PRECEDING), \
+         sum(x) OVER (ROWS 1 PRECEDING EXCLUDE GROUP) FROM t",
+    );
+    let exclusions: Vec<Option<WindowFrameExclusion>> = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(Expr::Function(Function {
+                over: Some(WindowType::WindowSpec(spec)),
+                ..
+            })) => spec.window_frame.as_ref().unwrap().exclude,
+            other => panic!("expected window function, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        vec![
+            Some(WindowFrameExclusion::Ties),
+            None,
+            Some(WindowFrameExclusion::Group)
+        ],
+        exclusions
+    );
+
+    // `OVER w` stays a named window reference; the definition is not expanded.
+    let select = pg_and_generic().verified_only_select(
+        "SELECT sum(x) OVER w FROM t WINDOW w AS (ROWS 1 PRECEDING EXCLUDE TIES)",
+    );
+    match expr_from_projection(&select.projection[0]) {
+        Expr::Function(Function {
+            over: Some(WindowType::NamedWindow(name)),
+            ..
+        }) => assert_eq!("w", name.value),
+        other => panic!("expected named window reference, got {other:?}"),
+    }
+    assert_eq!(1, select.named_window.len());
+    let NamedWindowDefinition(name, expr) = &select.named_window[0];
+    assert_eq!("w", name.value);
+    match expr {
+        NamedWindowExpr::WindowSpec(spec) => {
+            assert_eq!(
+                Some(WindowFrameExclusion::Ties),
+                spec.window_frame.as_ref().unwrap().exclude
+            );
+        }
+        other => panic!("expected window spec, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_window_frame_exclude_errors() {
+    let err = |sql: &str| {
+        pg_and_generic()
+            .parse_sql_statements(sql)
+            .map(|stmts| format!("{stmts:?}"))
+            .unwrap_err()
+    };
+
+    // EXCLUDE without frame units and bounds.
+    assert_eq!(
+        ParserError::ParserError("Expected: ROWS, RANGE, GROUPS, found: EXCLUDE".to_string()),
+        err("SELECT sum(x) OVER (EXCLUDE CURRENT ROW) FROM t")
+    );
+
+    // EXCLUDE between the two bounds of a BETWEEN .. AND frame.
+    assert_eq!(
+        ParserError::ParserError("Expected: AND, found: EXCLUDE".to_string()),
+        err("SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING EXCLUDE TIES AND 1 FOLLOWING) FROM t")
+    );
+
+    // EXCLUDE CURRENT without ROW.
+    assert_eq!(
+        ParserError::ParserError(
+            "Expected: CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE, found: CURRENT"
+                .to_string()
+        ),
+        err("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE CURRENT) FROM t")
+    );
+
+    // EXCLUDE NO without OTHERS.
+    assert_eq!(
+        ParserError::ParserError(
+            "Expected: CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE, found: NO".to_string()
+        ),
+        err("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE NO) FROM t")
+    );
+
+    // Unknown exclusion option.
+    assert_eq!(
+        ParserError::ParserError(
+            "Expected: CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE, found: FOO"
+                .to_string()
+        ),
+        err("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE FOO) FROM t")
+    );
+
+    // A duplicated EXCLUDE clause is an error located at the second EXCLUDE.
+    assert_eq!(
+        ParserError::ParserError("Expected: ), found: EXCLUDE".to_string()),
+        err("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES EXCLUDE GROUP) FROM t")
+    );
+    // ... and the reported position points at the second EXCLUDE keyword.
+    let res = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES EXCLUDE GROUP) FROM t",
+    );
+    assert_eq!(
+        ParserError::ParserError("Expected: ), found: EXCLUDE at Line: 1, Column: 51".to_string()),
+        res.unwrap_err()
+    );
+}
+
+#[test]
+fn parse_window_frame_exclude_unsupported_dialects() {
+    // Dialects that do not opt in to the feature reject the clause.
+    let dialects = all_dialects_except(|d| d.supports_window_frame_exclusion());
+    let res =
+        dialects.parse_sql_statements("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES) FROM t");
+    assert_eq!(
+        ParserError::ParserError("Expected: ), found: EXCLUDE".to_string()),
+        res.unwrap_err()
+    );
+}
+
+#[test]
+fn window_frame_exclude_pretty_round_trip() {
+    let cases = [
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING) FROM t",
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE NO OTHERS) FROM t",
+        "SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM t",
+        "SELECT sum(x) OVER (GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM t",
+        "SELECT sum(x) OVER w FROM t WINDOW w AS (RANGE 1 PRECEDING EXCLUDE TIES)",
+    ];
+    for sql in cases {
+        let ast = pg_and_generic().parse_sql_statements(sql).unwrap();
+        let formatted = format!("{:#}", ast[0]);
+        assert!(
+            formatted.contains("EXCLUDE") == sql.contains("EXCLUDE"),
+            "pretty output lost the EXCLUDE distinction for {sql}\n{formatted}"
+        );
+        let reparsed = pg_and_generic()
+            .parse_sql_statements(&formatted)
+            .unwrap_or_else(|e| panic!("formatted output failed to re-parse: {formatted}\n{e}"));
+        assert_eq!(
+            ast, reparsed,
+            "pretty round trip changed the AST for {sql}\nformatted:\n{formatted}"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(feature = "serde", feature = "serde_json"))]
+fn window_frame_exclude_serde_round_trip() {
+    let cases = [
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING) FROM t",
+        "SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE CURRENT ROW) FROM t",
+        "SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM t",
+        "SELECT sum(x) OVER (GROUPS 1 PRECEDING EXCLUDE TIES) FROM t",
+        "SELECT sum(x) OVER (RANGE 1 PRECEDING EXCLUDE NO OTHERS) FROM t",
+    ];
+    for sql in cases {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let json = serde_json::to_string(&ast).unwrap();
+        let deserialized: Vec<Statement> = serde_json::from_str(&json).unwrap();
+        assert_eq!(ast, deserialized, "serde round trip failed for {sql}");
+    }
+
+    // No EXCLUDE clause and an explicit EXCLUDE NO OTHERS serialize differently.
+    let json_of = |sql: &str| {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        serde_json::to_value(&ast).unwrap()
+    };
+    let frame_pointer =
+        "/0/Query/body/Select/projection/0/UnnamedExpr/Function/over/WindowSpec/window_frame";
+    let without_exclude = json_of("SELECT sum(x) OVER (ROWS 1 PRECEDING) FROM t");
+    let with_no_others = json_of("SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE NO OTHERS) FROM t");
+    assert_ne!(without_exclude, with_no_others);
+    // A frame without the clause keeps the original JSON shape.
+    let frame = without_exclude.pointer(frame_pointer).unwrap();
+    let mut keys: Vec<&String> = frame.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(["end_bound", "start_bound", "units"], keys.as_slice());
+    assert_eq!(
+        &serde_json::json!("NoOthers"),
+        with_no_others
+            .pointer(frame_pointer)
+            .and_then(|f| f.get("exclude"))
+            .unwrap()
+    );
+
+    // Old JSON with only units/start_bound/end_bound still deserializes and
+    // is treated as having no exclusion clause.
+    let frame: WindowFrame =
+        serde_json::from_str(r#"{"units":"Rows","start_bound":"CurrentRow","end_bound":null}"#)
+            .unwrap();
+    assert_eq!(
+        WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start_bound: WindowFrameBound::CurrentRow,
+            end_bound: None,
+            exclude: None,
+        },
+        frame
+    );
+}
+
+/// Returns the [WindowFrame] of the first projection of the given select.
+#[track_caller]
+fn window_frame_of(select: &Select) -> &WindowFrame {
+    match expr_from_projection(&select.projection[0]) {
+        Expr::Function(Function {
+            over: Some(WindowType::WindowSpec(spec)),
+            ..
+        }) => spec.window_frame.as_ref().expect("expected a window frame"),
+        other => panic!("expected a window function, got {other:?}"),
+    }
+}

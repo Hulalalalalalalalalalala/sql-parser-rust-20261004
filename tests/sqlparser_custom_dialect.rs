@@ -325,3 +325,41 @@ fn custom_dialect_lambda_arrow_syntax_without_keyword() {
     );
     assert!(Parser::parse_sql(&dialect, "SELECT transform(xs, lambda x : x + 1)").is_err());
 }
+
+#[test]
+fn custom_dialect_window_frame_exclusion() {
+    // A custom dialect that does not opt in rejects the window frame
+    // EXCLUDE clause, without needing to implement any new method.
+    #[derive(Debug)]
+    struct DefaultDialect {}
+    impl Dialect for DefaultDialect {
+        fn is_identifier_start(&self, ch: char) -> bool {
+            is_identifier_start(ch)
+        }
+        fn is_identifier_part(&self, ch: char) -> bool {
+            is_identifier_part(ch)
+        }
+    }
+
+    // A custom dialect can explicitly opt in to the feature.
+    #[derive(Debug)]
+    struct ExcludeDialect {}
+    impl Dialect for ExcludeDialect {
+        fn is_identifier_start(&self, ch: char) -> bool {
+            is_identifier_start(ch)
+        }
+        fn is_identifier_part(&self, ch: char) -> bool {
+            is_identifier_part(ch)
+        }
+        fn supports_window_frame_exclusion(&self) -> bool {
+            true
+        }
+    }
+
+    let sql = "SELECT sum(x) OVER (ROWS 1 PRECEDING EXCLUDE TIES) FROM t";
+    assert!(Parser::parse_sql(&DefaultDialect {}, sql).is_err());
+    assert_eq!(
+        sql,
+        &format!("{}", Parser::parse_sql(&ExcludeDialect {}, sql).unwrap()[0])
+    );
+}

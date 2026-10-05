@@ -187,6 +187,10 @@ impl Dialect for PostgreSqlDialect {
         true
     }
 
+    fn supports_window_frame_exclusion(&self) -> bool {
+        true
+    }
+
     fn prec_value(&self, prec: Precedence) -> u8 {
         match prec {
             Precedence::Period => PERIOD_PREC,
