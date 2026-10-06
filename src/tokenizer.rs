@@ -850,6 +850,23 @@ impl State<'_> {
     }
 }
 
+/// Return the [`Location`] just past the last character of `sql`, using the
+/// same line/column counting rules as the tokenizer (columns count Unicode
+/// code points, and a lone `\r`, a lone `\n`, or a `\r\n` pair each count as
+/// a single newline).
+///
+/// For an empty string this returns line 1, column 1.
+pub(crate) fn end_of_input_location(sql: &str) -> Location {
+    let mut state = State {
+        peekable: sql.chars().peekable(),
+        line: 1,
+        col: 1,
+        prev_was_cr: false,
+    };
+    while state.next().is_some() {}
+    state.location()
+}
+
 /// Represents how many quote characters enclose a string literal.
 #[derive(Copy, Clone)]
 enum NumStringQuoteChars {
