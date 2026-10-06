@@ -24,8 +24,9 @@ use matches::assert_matches;
 
 use sqlparser::ast::MysqlInsertPriority::{Delayed, HighPriority, LowPriority};
 use sqlparser::ast::*;
-use sqlparser::dialect::{GenericDialect, MySqlDialect};
+use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect};
 use sqlparser::parser::{ParserError, ParserOptions};
+use sqlparser::tokenizer::Location;
 use sqlparser::tokenizer::Span;
 use sqlparser::tokenizer::Token;
 use test_utils::*;
@@ -5120,6 +5121,69 @@ fn parse_alter_table_column_position() {
         assert!(
             mysql_and_generic().parse_sql_statements(sql).is_err(),
             "{sql}"
+        );
+    }
+}
+
+#[test]
+fn parse_comment_hint_expression_locations() {
+    // The contents of `/*!...*/` comments are parsed, and the locations of
+    // the resulting expressions refer to the original query.
+    let sql = "SELECT /*!50110 a + */ b";
+    for dialect in [
+        Box::new(MySqlDialect {}) as Box<dyn Dialect>,
+        Box::new(GenericDialect {}),
+    ] {
+        let ast = sqlparser::parser::Parser::parse_sql(dialect.as_ref(), sql).unwrap();
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Statement::Query(query) => match query.body.as_ref() {
+                SetExpr::Select(select) => match &select.projection[0] {
+                    SelectItem::UnnamedExpr(Expr::BinaryOp { left, right, .. }) => {
+                        assert_eq!(
+                            left.span(),
+                            Span::new(Location::new(1, 17), Location::new(1, 18))
+                        );
+                        assert_eq!(
+                            right.span(),
+                            Span::new(Location::new(1, 24), Location::new(1, 25))
+                        );
+                    }
+                    projection => panic!("expected a binary expression, got {projection:?}"),
+                },
+                body => panic!("expected a SELECT, got {body:?}"),
+            },
+            stmt => panic!("expected a query, got {stmt:?}"),
+        }
+    }
+}
+
+#[test]
+fn parse_comment_hint_error_locations() {
+    // Errors inside an expanded `/*!...*/` comment point at the original
+    // query.
+    for dialect in [
+        Box::new(MySqlDialect {}) as Box<dyn Dialect>,
+        Box::new(GenericDialect {}),
+    ] {
+        let err =
+            sqlparser::parser::Parser::parse_sql(dialect.as_ref(), "SELECT /*!50110 a + ) */ b")
+                .unwrap_err();
+        assert_eq!(
+            ParserError::ParserError(
+                "Expected: an expression, found: ) at Line: 1, Column: 21".to_string()
+            ),
+            err
+        );
+
+        let err =
+            sqlparser::parser::Parser::parse_sql(dialect.as_ref(), "SELECT /*!50110 'bad */ 1")
+                .unwrap_err();
+        assert_eq!(
+            ParserError::TokenizerError(
+                "Unterminated string literal at Line: 1, Column: 17".to_string()
+            ),
+            err
         );
     }
 }
