@@ -24,10 +24,10 @@ use matches::assert_matches;
 
 use sqlparser::ast::MysqlInsertPriority::{Delayed, HighPriority, LowPriority};
 use sqlparser::ast::*;
-use sqlparser::dialect::{GenericDialect, MySqlDialect};
-use sqlparser::parser::{ParserError, ParserOptions};
-use sqlparser::tokenizer::Span;
+use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect};
+use sqlparser::parser::{Parser, ParserError, ParserOptions};
 use sqlparser::tokenizer::Token;
+use sqlparser::tokenizer::{Location, Span};
 use test_utils::*;
 
 #[macro_use]
@@ -4898,6 +4898,66 @@ fn test_optimizer_hints() {
     mysql_dialect.verified_stmt("INSERT /*abc+ append */ INTO t2 VALUES (2)");
     mysql_dialect.verified_stmt("UPDATE /*abc+ PARALLEL */ table_name SET column1 = 1");
     mysql_dialect.verified_stmt("DELETE /*abc+ ENABLE_DML */ FROM table_name");
+}
+
+#[test]
+fn parse_comment_hint_expression_locations() {
+    // Identifiers expanded from a `/*! ... */` comment hint are located at
+    // their position in the original SQL, past the `/*!` and the version
+    // number, and content after the comment keeps its own position.
+    let sql = "SELECT /*!50110 a + */ b";
+    for dialect in [&MySqlDialect {} as &dyn Dialect, &GenericDialect {}] {
+        let statements = Parser::parse_sql(dialect, sql).unwrap();
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected a query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected a select");
+        };
+        let Expr::BinaryOp { left, op, right } = expr_from_projection(&select.projection[0]) else {
+            panic!("expected a binary expression");
+        };
+        assert_eq!(&BinaryOperator::Plus, op);
+        let Expr::Identifier(a) = left.as_ref() else {
+            panic!("expected an identifier");
+        };
+        assert_eq!("a", a.value);
+        assert_eq!(
+            Span::new(Location::new(1, 17), Location::new(1, 18)),
+            a.span
+        );
+        let Expr::Identifier(b) = right.as_ref() else {
+            panic!("expected an identifier");
+        };
+        assert_eq!("b", b.value);
+        assert_eq!(
+            Span::new(Location::new(1, 24), Location::new(1, 25)),
+            b.span
+        );
+    }
+}
+
+#[test]
+fn parse_comment_hint_error_locations() {
+    for dialect in [&MySqlDialect {} as &dyn Dialect, &GenericDialect {}] {
+        // A missing expression is reported at the offending token in the
+        // original SQL.
+        assert_eq!(
+            Parser::parse_sql(dialect, "SELECT /*!50110 a + ) */ b").unwrap_err(),
+            ParserError::ParserError(
+                "Expected: an expression, found: ) at Line: 1, Column: 21".to_string()
+            )
+        );
+
+        // An unterminated string is reported at its opening quote in the
+        // original SQL.
+        assert_eq!(
+            Parser::parse_sql(dialect, "SELECT /*!50110 'bad */ 1").unwrap_err(),
+            ParserError::TokenizerError(
+                "Unterminated string literal at Line: 1, Column: 17".to_string()
+            )
+        );
+    }
 }
 
 #[test]

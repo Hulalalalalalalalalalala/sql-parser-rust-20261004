@@ -801,6 +801,9 @@ struct State<'a> {
     peekable: Peekable<Chars<'a>>,
     line: u64,
     col: u64,
+    /// True if the previously consumed character was a carriage return (`\r`),
+    /// so that the `\n` of a CRLF pair is not counted as a second newline.
+    prev_was_cr: bool,
 }
 
 impl State<'_> {
@@ -809,12 +812,25 @@ impl State<'_> {
         match self.peekable.next() {
             None => None,
             Some(s) => {
-                if s == '\n' {
-                    self.line += 1;
-                    self.col = 1;
-                } else {
-                    self.col += 1;
+                match s {
+                    // A lone `\r` counts as a newline. In a `\r\n` pair the
+                    // `\r` already advanced the line, so the `\n` does not
+                    // count as another newline.
+                    '\r' => {
+                        self.line += 1;
+                        self.col = 1;
+                    }
+                    '\n' => {
+                        if !self.prev_was_cr {
+                            self.line += 1;
+                        }
+                        self.col = 1;
+                    }
+                    _ => {
+                        self.col += 1;
+                    }
                 }
+                self.prev_was_cr = s == '\r';
                 Some(s)
             }
         }
@@ -962,6 +978,7 @@ impl<'a> Tokenizer<'a> {
             peekable: self.query.chars().peekable(),
             line: 1,
             col: 1,
+            prev_was_cr: false,
         };
 
         let mut location = state.location();
@@ -1010,11 +1027,17 @@ impl<'a> Tokenizer<'a> {
         // Create a new tokenizer for the hint content
         let inner = Tokenizer::new(self.dialect, hint_content).with_unescape(self.unescape);
 
-        // Create a state for tracking position within the hint
+        // Create a state for tracking position within the hint, starting at
+        // the position of the hint content in the original query. The hint
+        // content follows the `/*` that opened the comment (2 columns after
+        // the comment token starts) and the stripped `!` and version digits,
+        // all of which are ASCII and thus occupy a single column each.
+        let stripped_prefix_len = comment.len() - hint_content.len();
         let mut state = State {
             peekable: hint_content.chars().peekable(),
             line: span.start.line,
-            col: span.start.column,
+            col: span.start.column + 2 + stripped_prefix_len as u64,
+            prev_was_cr: false,
         };
 
         // Tokenize the hint content and add tokens to the buffer
@@ -1047,6 +1070,7 @@ impl<'a> Tokenizer<'a> {
                 peekable: word.chars().peekable(),
                 line: 0,
                 col: 0,
+                prev_was_cr: false,
             };
             let mut s = peeking_take_while(&mut inner_state, |ch| matches!(ch, '0'..='9' | '.'));
             let s2 = peeking_take_while(chars, |ch| matches!(ch, '0'..='9' | '.'));
@@ -2180,6 +2204,7 @@ impl<'a> Tokenizer<'a> {
             peekable: chars.peekable.clone(),
             line: chars.line,
             col: chars.col,
+            prev_was_cr: chars.prev_was_cr,
         };
         self.skip_whitespace_and_comments(&mut lookahead)?;
         if !take_uescape_keyword(&mut lookahead) {
@@ -2251,6 +2276,7 @@ impl<'a> Tokenizer<'a> {
             peekable: lookahead.peekable.clone(),
             line: lookahead.line,
             col: lookahead.col,
+            prev_was_cr: lookahead.prev_was_cr,
         };
         self.skip_whitespace_and_comments(&mut duplicate)?;
         let duplicate_location = duplicate.location();
@@ -2803,6 +2829,7 @@ fn take_uescape_keyword(chars: &mut State<'_>) -> bool {
         peekable: chars.peekable.clone(),
         line: chars.line,
         col: chars.col,
+        prev_was_cr: chars.prev_was_cr,
     };
     for expected in "UESCAPE".chars() {
         match lookahead.next() {
@@ -4058,6 +4085,7 @@ mod tests {
             peekable: s.chars().peekable(),
             line: 0,
             col: 0,
+            prev_was_cr: false,
         };
 
         assert_eq!(
@@ -4743,6 +4771,480 @@ mod tests {
             ],
             tokens,
         );
+    }
+
+    #[test]
+    fn tokenize_multiline_comment_hint_locations() {
+        // Tokens expanded from a `/*! ... */` comment hint are located at
+        // their position in the original query, past the `/*!` and the
+        // version number, and content after the comment keeps its own
+        // position.
+        let sql = "SELECT /*!50110 a + */ b";
+        for dialect in [&MySqlDialect {} as &dyn Dialect, &GenericDialect {}] {
+            let tokens = Tokenizer::new(dialect, sql)
+                .tokenize_with_location()
+                .unwrap();
+            let expected = vec![
+                TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 7).into(),
+                    (1, 8).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 16).into(),
+                    (1, 17).into(),
+                ),
+                TokenWithSpan::at(Token::make_word("a", None), (1, 17).into(), (1, 18).into()),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 18).into(),
+                    (1, 19).into(),
+                ),
+                TokenWithSpan::at(Token::Plus, (1, 19).into(), (1, 20).into()),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 20).into(),
+                    (1, 21).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 23).into(),
+                    (1, 24).into(),
+                ),
+                TokenWithSpan::at(Token::make_word("b", None), (1, 24).into(), (1, 25).into()),
+            ];
+            compare(expected, tokens);
+        }
+    }
+
+    #[test]
+    fn tokenize_multiline_comment_hint_locations_without_version() {
+        // A comment hint without a version number is also located at its
+        // position in the original query.
+        let sql = "SELECT /*! a + */ b";
+        let dialect = MySqlDialect {};
+        let tokens = Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .unwrap();
+        let expected = vec![
+            TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 7).into(),
+                (1, 8).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 11).into(),
+                (1, 12).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("a", None), (1, 12).into(), (1, 13).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 13).into(),
+                (1, 14).into(),
+            ),
+            TokenWithSpan::at(Token::Plus, (1, 14).into(), (1, 15).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 15).into(),
+                (1, 16).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 18).into(),
+                (1, 19).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("b", None), (1, 19).into(), (1, 20).into()),
+        ];
+        compare(expected, tokens);
+    }
+
+    #[test]
+    fn tokenize_multiline_comment_hint_locations_multiple_hints() {
+        // Locations do not restart at the comment start when the comment is
+        // preceded by other SQL or when a statement contains multiple hints.
+        let sql = "SELECT 1 /*! a */ + /*! b */";
+        let dialect = MySqlDialect {};
+        let tokens = Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .unwrap();
+        let expected = vec![
+            TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 7).into(),
+                (1, 8).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Number("1".to_string(), false),
+                (1, 8).into(),
+                (1, 9).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 9).into(),
+                (1, 10).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 13).into(),
+                (1, 14).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("a", None), (1, 14).into(), (1, 15).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 15).into(),
+                (1, 16).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 18).into(),
+                (1, 19).into(),
+            ),
+            TokenWithSpan::at(Token::Plus, (1, 19).into(), (1, 20).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 20).into(),
+                (1, 21).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 24).into(),
+                (1, 25).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("b", None), (1, 25).into(), (1, 26).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 26).into(),
+                (1, 27).into(),
+            ),
+        ];
+        compare(expected, tokens);
+    }
+
+    #[test]
+    fn tokenize_multiline_comment_hint_locations_newlines() {
+        // LF, lone CR and CRLF inside a comment hint each count as a single
+        // newline, and the following line starts at column 1.
+        for newline in ["\n", "\r", "\r\n"] {
+            let sql = format!("SELECT /*!50110{newline}a + */ b");
+            let dialect = MySqlDialect {};
+            let tokens = Tokenizer::new(&dialect, &sql)
+                .tokenize_with_location()
+                .unwrap();
+            let expected = vec![
+                TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 7).into(),
+                    (1, 8).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Newline),
+                    (1, 16).into(),
+                    (2, 1).into(),
+                ),
+                TokenWithSpan::at(Token::make_word("a", None), (2, 1).into(), (2, 2).into()),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (2, 2).into(),
+                    (2, 3).into(),
+                ),
+                TokenWithSpan::at(Token::Plus, (2, 3).into(), (2, 4).into()),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (2, 4).into(),
+                    (2, 5).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (2, 7).into(),
+                    (2, 8).into(),
+                ),
+                TokenWithSpan::at(Token::make_word("b", None), (2, 8).into(), (2, 9).into()),
+            ];
+            compare(expected, tokens);
+        }
+
+        // Consecutive newlines each advance the line.
+        let sql = "SELECT /*!50110\n\na */ b";
+        let dialect = MySqlDialect {};
+        let tokens = Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .unwrap();
+        let expected = vec![
+            TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 7).into(),
+                (1, 8).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Newline),
+                (1, 16).into(),
+                (2, 1).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Newline),
+                (2, 1).into(),
+                (3, 1).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("a", None), (3, 1).into(), (3, 2).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (3, 2).into(),
+                (3, 3).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (3, 5).into(),
+                (3, 6).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("b", None), (3, 6).into(), (3, 7).into()),
+        ];
+        compare(expected, tokens);
+    }
+
+    #[test]
+    fn tokenize_multiline_comment_hint_locations_unicode() {
+        // Columns are counted in Unicode code points: a CJK character and a
+        // supplementary plane character each occupy a single column.
+        let sql = "SELECT /*!50110 中 + */ \u{10FFFF}";
+        let dialect = MySqlDialect {};
+        let tokens = Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .unwrap();
+        let expected = vec![
+            TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 7).into(),
+                (1, 8).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 16).into(),
+                (1, 17).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("中", None), (1, 17).into(), (1, 18).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 18).into(),
+                (1, 19).into(),
+            ),
+            TokenWithSpan::at(Token::Plus, (1, 19).into(), (1, 20).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 20).into(),
+                (1, 21).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 23).into(),
+                (1, 24).into(),
+            ),
+            TokenWithSpan::at(
+                Token::make_word("\u{10FFFF}", None),
+                (1, 24).into(),
+                (1, 25).into(),
+            ),
+        ];
+        compare(expected, tokens);
+    }
+
+    #[test]
+    fn tokenize_multiline_comment_hint_locations_strings() {
+        // An actual newline inside a string literal in a comment hint counts
+        // as a newline; a backslash escape sequence does not, whether or not
+        // unescaping is enabled.
+        let dialect = MySqlDialect {};
+        let tokens = Tokenizer::new(&dialect, "SELECT /*!50110 'a\nb' */ 1")
+            .tokenize_with_location()
+            .unwrap();
+        let expected = vec![
+            TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 7).into(),
+                (1, 8).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 16).into(),
+                (1, 17).into(),
+            ),
+            TokenWithSpan::at(
+                Token::SingleQuotedString("a\nb".to_string()),
+                (1, 17).into(),
+                (2, 3).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (2, 3).into(),
+                (2, 4).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (2, 6).into(),
+                (2, 7).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Number("1".to_string(), false),
+                (2, 7).into(),
+                (2, 8).into(),
+            ),
+        ];
+        compare(expected, tokens);
+
+        for (unescape, value) in [(true, "a\nb"), (false, r"a\nb")] {
+            let tokens = Tokenizer::new(&dialect, r"SELECT /*!50110 'a\nb' */ 1")
+                .with_unescape(unescape)
+                .tokenize_with_location()
+                .unwrap();
+            let expected = vec![
+                TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 7).into(),
+                    (1, 8).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 16).into(),
+                    (1, 17).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::SingleQuotedString(value.to_string()),
+                    (1, 17).into(),
+                    (1, 23).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 23).into(),
+                    (1, 24).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Whitespace(Whitespace::Space),
+                    (1, 26).into(),
+                    (1, 27).into(),
+                ),
+                TokenWithSpan::at(
+                    Token::Number("1".to_string(), false),
+                    (1, 27).into(),
+                    (1, 28).into(),
+                ),
+            ];
+            compare(expected, tokens);
+        }
+    }
+
+    #[test]
+    fn tokenize_multiline_comment_hint_error_locations() {
+        // Errors while tokenizing a comment hint are reported at the location
+        // of the offending character in the original query.
+        let dialect = MySqlDialect {};
+        assert_eq!(
+            Tokenizer::new(&dialect, "SELECT /*!50110 'bad */ 1")
+                .tokenize_with_location()
+                .unwrap_err(),
+            TokenizerError {
+                message: "Unterminated string literal".to_string(),
+                location: Location {
+                    line: 1,
+                    column: 17
+                },
+            }
+        );
+
+        // When appending to an existing buffer, tokens recognized before the
+        // failure keep their spans and the failed token is not added.
+        let mut buf = vec![];
+        let err = Tokenizer::new(&dialect, "SELECT /*!50110 a 'bad */ 1")
+            .tokenize_with_location_into_buf(&mut buf)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TokenizerError {
+                message: "Unterminated string literal".to_string(),
+                location: Location {
+                    line: 1,
+                    column: 19
+                },
+            }
+        );
+        let expected = vec![
+            TokenWithSpan::at(Token::make_keyword("SELECT"), (1, 1).into(), (1, 7).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 7).into(),
+                (1, 8).into(),
+            ),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 16).into(),
+                (1, 17).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("a", None), (1, 17).into(), (1, 18).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Space),
+                (1, 18).into(),
+                (1, 19).into(),
+            ),
+        ];
+        compare(expected, buf);
+
+        // The mapper receives tokens with spans in the original query.
+        let mut spans = vec![];
+        let mut buf = vec![];
+        Tokenizer::new(&dialect, "SELECT /*!50110 a + */ b")
+            .tokenize_with_location_into_buf_with_mapper(&mut buf, |token| {
+                spans.push(token.span);
+                token
+            })
+            .unwrap();
+        let expected_spans: Vec<Span> = Tokenizer::new(&dialect, "SELECT /*!50110 a + */ b")
+            .tokenize_with_location()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.span)
+            .collect();
+        compare(expected_spans, spans);
+    }
+
+    #[test]
+    fn tokenize_newline_locations() {
+        // LF, lone CR and CRLF each count as a single newline, both inside
+        // and outside of comments.
+        let sql = "a\r\nb\rc\nd";
+        let dialect = GenericDialect {};
+        let tokens = Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .unwrap();
+        let expected = vec![
+            TokenWithSpan::at(Token::make_word("a", None), (1, 1).into(), (1, 2).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Newline),
+                (1, 2).into(),
+                (2, 1).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("b", None), (2, 1).into(), (2, 2).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Newline),
+                (2, 2).into(),
+                (3, 1).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("c", None), (3, 1).into(), (3, 2).into()),
+            TokenWithSpan::at(
+                Token::Whitespace(Whitespace::Newline),
+                (3, 2).into(),
+                (4, 1).into(),
+            ),
+            TokenWithSpan::at(Token::make_word("d", None), (4, 1).into(), (4, 2).into()),
+        ];
+        compare(expected, tokens);
     }
 
     #[test]
