@@ -194,14 +194,57 @@ impl core::error::Error for ParserError {}
 // By default, allow expressions up to this deep before erroring
 const DEFAULT_REMAINING_DEPTH: usize = 50;
 
-// A constant EOF token that can be referenced.
-const EOF_TOKEN: TokenWithSpan = TokenWithSpan {
-    token: Token::EOF,
-    span: Span {
-        start: Location { line: 0, column: 0 },
-        end: Location { line: 0, column: 0 },
-    },
-};
+/// Returns the [`Location`] just past the last character of `sql`,
+/// using the same rules as the [`Tokenizer`]: lines and columns are
+/// 1-based, columns count Unicode code points (a tab occupies a single
+/// column), and a lone `\r`, a lone `\n`, or a `\r\n` pair each count
+/// as a single newline.
+fn end_of_input_location(sql: &str) -> Location {
+    let mut line = 1;
+    let mut column = 1;
+    let mut prev_was_cr = false;
+    for ch in sql.chars() {
+        match ch {
+            '\r' => {
+                line += 1;
+                column = 1;
+            }
+            '\n' => {
+                if !prev_was_cr {
+                    line += 1;
+                }
+                column = 1;
+            }
+            _ => {
+                column += 1;
+            }
+        }
+        prev_was_cr = ch == '\r';
+    }
+    Location { line, column }
+}
+
+/// Returns the EOF token to use when reading past the end of `tokens`.
+///
+/// The span is a zero-width range located at the end of the input: if
+/// the token stream explicitly ends with an EOF token, its start
+/// location is used; otherwise the end location of the last token
+/// (which may be trailing whitespace) is used. If no end location can
+/// be determined (an empty token stream, or tokens without locations),
+/// the span is empty.
+fn eof_token_for(tokens: &[TokenWithSpan]) -> TokenWithSpan {
+    let location = match tokens.last() {
+        Some(last) if last.token == Token::EOF => last.span.start,
+        Some(last) => last.span.end,
+        None => Location::empty(),
+    };
+    let span = if location.line == 0 {
+        Span::empty()
+    } else {
+        Span::new(location, location)
+    };
+    TokenWithSpan::new(Token::EOF, span)
+}
 
 /// Composite types declarations using angle brackets syntax can be arbitrary
 /// nested such that the following declaration is possible:
@@ -335,6 +378,11 @@ pub struct Parser<'a> {
     tokens: Vec<TokenWithSpan>,
     /// The index of the first unprocessed token in [`Parser::tokens`].
     index: usize,
+    /// The token returned when reading past the end of
+    /// [`Parser::tokens`]. Its span is a zero-width range located just
+    /// past the last character of the input, or empty if the end
+    /// location is unknown.
+    eof_token: TokenWithSpan,
     /// The current state of the parser.
     state: ParserState,
     /// The SQL dialect to use.
@@ -399,6 +447,7 @@ impl<'a> Parser<'a> {
         Self {
             tokens: vec![],
             index: 0,
+            eof_token: TokenWithSpan::wrap(Token::EOF),
             state: ParserState::Normal,
             dialect,
             recursion_counter: RecursionCounter::new(DEFAULT_REMAINING_DEPTH),
@@ -470,6 +519,7 @@ impl<'a> Parser<'a> {
 
     /// Reset this parser to parse the specified token stream
     pub fn with_tokens_with_locations(mut self, tokens: Vec<TokenWithSpan>) -> Self {
+        self.eof_token = eof_token_for(&tokens);
         self.tokens = tokens;
         self.index = 0;
         self.failed_prefix_positions.clear();
@@ -503,7 +553,14 @@ impl<'a> Parser<'a> {
         let tokens = Tokenizer::new(self.dialect, sql)
             .with_unescape(self.options.unescape)
             .tokenize_with_location()?;
-        Ok(self.with_tokens_with_locations(tokens))
+        let mut parser = self.with_tokens_with_locations(tokens);
+        // Locate EOF just past the last character of the input, so that
+        // trailing whitespace and comments (including MySQL executable
+        // comments, whose tokens are expanded in place and thus do not
+        // reach the end of the input) are accounted for.
+        let eof_location = end_of_input_location(sql);
+        parser.eof_token = TokenWithSpan::new(Token::EOF, Span::new(eof_location, eof_location));
+        Ok(parser)
     }
 
     /// Parse potentially multiple statements
@@ -4672,7 +4729,7 @@ impl<'a> Parser<'a> {
     /// Return the token at the given location, or EOF if the index is beyond
     /// the length of the current set of tokens.
     pub fn token_at(&self, index: usize) -> &TokenWithSpan {
-        self.tokens.get(index).unwrap_or(&EOF_TOKEN)
+        self.tokens.get(index).unwrap_or(&self.eof_token)
     }
 
     /// Return the first non-whitespace token that has not yet been processed
@@ -4732,10 +4789,7 @@ impl<'a> Parser<'a> {
             {
                 continue;
             }
-            break token.cloned().unwrap_or(TokenWithSpan {
-                token: Token::EOF,
-                span: Span::empty(),
-            });
+            break token.cloned().unwrap_or_else(|| self.eof_token.clone());
         })
     }
 
@@ -4755,7 +4809,7 @@ impl<'a> Parser<'a> {
             {
                 continue;
             }
-            break token.unwrap_or(&EOF_TOKEN);
+            break token.unwrap_or(&self.eof_token);
         })
     }
 
@@ -4776,7 +4830,7 @@ impl<'a> Parser<'a> {
                 }) => continue,
                 non_whitespace => {
                     if n == 0 {
-                        return non_whitespace.unwrap_or(&EOF_TOKEN);
+                        return non_whitespace.unwrap_or(&self.eof_token);
                     }
                     n -= 1;
                 }
@@ -4795,15 +4849,12 @@ impl<'a> Parser<'a> {
         self.tokens
             .get(self.index + n)
             .cloned()
-            .unwrap_or(TokenWithSpan {
-                token: Token::EOF,
-                span: Span::empty(),
-            })
+            .unwrap_or_else(|| self.eof_token.clone())
     }
 
     /// Return nth token, possibly whitespace, that has not yet been processed.
     fn peek_nth_token_no_skip_ref(&self, n: usize) -> &TokenWithSpan {
-        self.tokens.get(self.index + n).unwrap_or(&EOF_TOKEN)
+        self.tokens.get(self.index + n).unwrap_or(&self.eof_token)
     }
 
     /// Return true if the next tokens exactly `expected`
@@ -4915,7 +4966,7 @@ impl<'a> Parser<'a> {
 
     /// Report that the token at `index` was found instead of `expected`.
     pub fn expected_at<T>(&self, expected: &str, index: usize) -> Result<T, ParserError> {
-        let found = self.tokens.get(index).unwrap_or(&EOF_TOKEN);
+        let found = self.tokens.get(index).unwrap_or(&self.eof_token);
         parser_err!(
             format!("Expected: {expected}, found: {found}"),
             found.span.start
@@ -12742,7 +12793,8 @@ impl<'a> Parser<'a> {
                 // 2. Not calling self.next_token() to enforce `tok`
                 //    be followed immediately by a word/number, ie.
                 //    without any whitespace in between
-                let next_token = self.next_token_no_skip().unwrap_or(&EOF_TOKEN).clone();
+                let eof_token = self.eof_token.clone();
+                let next_token = self.next_token_no_skip().unwrap_or(&eof_token).clone();
                 let ident = match next_token.token {
                     Token::Word(w) if w.quote_style.is_none() => Ok(w.into_ident(next_token.span)),
                     Token::Number(w, false) => Ok(Ident::with_span(next_token.span, w)),
@@ -14180,7 +14232,7 @@ impl<'a> Parser<'a> {
                         let token = self
                             .next_token_no_skip()
                             .cloned()
-                            .unwrap_or(TokenWithSpan::wrap(Token::EOF));
+                            .unwrap_or_else(|| self.eof_token.clone());
                         requires_whitespace = match token.token {
                             Token::Word(next_word) if next_word.quote_style.is_none() => {
                                 ident.value.push_str(&next_word.value);
@@ -21692,6 +21744,187 @@ mod tests {
                 ]
             ))
         })
+    }
+
+    #[test]
+    fn test_eof_location_in_error() {
+        let dialect = GenericDialect {};
+        let err = Parser::new(&dialect)
+            .try_with_sql("SELECT -")
+            .unwrap()
+            .parse_statements()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sql parser error: Expected: an expression, found: EOF at Line: 1, Column: 9"
+        );
+
+        // Trailing whitespace, newlines, and comments all count towards
+        // the EOF location; columns count Unicode code points.
+        let err = Parser::new(&dialect)
+            .try_with_sql("SELECT 1 +\r\n/*中*/ ")
+            .unwrap()
+            .parse_statements()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sql parser error: Expected: an expression, found: EOF at Line: 2, Column: 7"
+        );
+
+        // A missing `)` reports the EOF location as well.
+        let err = Parser::new(&dialect)
+            .try_with_sql("SELECT (1")
+            .unwrap()
+            .parse_statements()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sql parser error: Expected: ), found: EOF at Line: 1, Column: 10"
+        );
+    }
+
+    #[test]
+    fn test_eof_location_mysql_executable_comment() {
+        let dialect = MySqlDialect {};
+        // Executable comments are expanded in place, but EOF is still
+        // located just past the last character of the original input.
+        for sql in [
+            "SELECT 1 + /*!*/",
+            "SELECT 1 + /*!50110 */ ",
+            "SELECT 1 + /*!50110 KEY_BLOCK_SIZE = */",
+        ] {
+            let err = Parser::new(&dialect)
+                .try_with_sql(sql)
+                .unwrap()
+                .parse_statements()
+                .unwrap_err();
+            let expected_column = sql.chars().count() + 1;
+            assert!(
+                err.to_string()
+                    .ends_with(&format!("found: EOF at Line: 1, Column: {expected_column}")),
+                "unexpected error for {sql:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_eof_token_span() {
+        let dialect = GenericDialect {};
+
+        // Empty input: EOF is at the start of the input.
+        let mut parser = Parser::new(&dialect).try_with_sql("").unwrap();
+        assert_eq!(
+            parser.next_token(),
+            TokenWithSpan::new(
+                Token::EOF,
+                Span::new(Location::new(1, 1), Location::new(1, 1))
+            )
+        );
+
+        // Input consisting only of whitespace and comments parses to no
+        // statements.
+        let statements = Parser::new(&dialect)
+            .try_with_sql("  -- hi\n /* x */ ")
+            .unwrap()
+            .parse_statements()
+            .unwrap();
+        assert_eq!(statements, Vec::new());
+
+        // The EOF span is a zero-width range just past the last
+        // character of the input, and is consistent across all read
+        // APIs, repeated reads, and backing up over the EOF.
+        let mut parser = Parser::new(&dialect).try_with_sql("SELECT 1  ").unwrap();
+        let eof_span = Span::new(Location::new(1, 11), Location::new(1, 11));
+        while !matches!(parser.next_token().token, Token::EOF) {}
+        assert_eq!(parser.peek_token().span, eof_span);
+        assert_eq!(parser.peek_token_ref().span, eof_span);
+        assert_eq!(parser.peek_nth_token(2).span, eof_span);
+        assert_eq!(parser.peek_nth_token_ref(1).span, eof_span);
+        assert_eq!(parser.peek_token_no_skip().span, eof_span);
+        assert_eq!(parser.peek_nth_token_no_skip(3).span, eof_span);
+        assert_eq!(parser.token_at(100).span, eof_span);
+        assert_eq!(parser.get_current_token().span, eof_span);
+        assert_eq!(parser.get_next_token().span, eof_span);
+        assert!(parser
+            .peek_tokens_with_location::<2>()
+            .iter()
+            .all(|t| t.span == eof_span));
+        assert!(parser
+            .peek_tokens_ref::<2>()
+            .iter()
+            .all(|t| t.span == eof_span));
+        assert_eq!(parser.next_token().span, eof_span);
+        parser.prev_token();
+        assert_eq!(parser.next_token().span, eof_span);
+
+        // Reusing the parser with new input resets the EOF location.
+        let mut parser = parser.try_with_sql("SELECT 1").unwrap();
+        while !matches!(parser.next_token().token, Token::EOF) {}
+        assert_eq!(
+            parser.next_token().span,
+            Span::new(Location::new(1, 9), Location::new(1, 9))
+        );
+    }
+
+    #[test]
+    fn test_eof_location_from_tokens() {
+        let dialect = GenericDialect {};
+        let select = || {
+            TokenWithSpan::new(
+                Token::make_keyword("SELECT"),
+                Span::new(Location::new(1, 1), Location::new(1, 7)),
+            )
+        };
+
+        // An explicit trailing EOF token provides the EOF location.
+        let parser = Parser::new(&dialect).with_tokens_with_locations(vec![
+            select(),
+            TokenWithSpan::new(
+                Token::EOF,
+                Span::new(Location::new(3, 5), Location::new(3, 5)),
+            ),
+        ]);
+        assert_eq!(
+            parser.token_at(10).span,
+            Span::new(Location::new(3, 5), Location::new(3, 5))
+        );
+
+        // Otherwise the end of the last token is used, including
+        // trailing whitespace tokens.
+        let parser = Parser::new(&dialect).with_tokens_with_locations(vec![
+            select(),
+            TokenWithSpan::new(
+                Token::Whitespace(Whitespace::Space),
+                Span::new(Location::new(1, 7), Location::new(1, 9)),
+            ),
+        ]);
+        assert_eq!(
+            parser.token_at(10).span,
+            Span::new(Location::new(1, 9), Location::new(1, 9))
+        );
+
+        // No location information is fabricated: empty token streams,
+        // tokens without locations, and `with_tokens` all yield an
+        // empty EOF span.
+        let parser = Parser::new(&dialect).with_tokens_with_locations(vec![]);
+        assert_eq!(parser.token_at(0).span, Span::empty());
+
+        let parser = Parser::new(&dialect)
+            .with_tokens_with_locations(vec![TokenWithSpan::wrap(Token::make_keyword("SELECT"))]);
+        assert_eq!(parser.token_at(10).span, Span::empty());
+
+        let parser = Parser::new(&dialect)
+            .with_tokens_with_locations(vec![select(), TokenWithSpan::wrap(Token::EOF)]);
+        assert_eq!(parser.token_at(10).span, Span::empty());
+
+        let err = Parser::new(&dialect)
+            .with_tokens(vec![Token::make_keyword("SELECT")])
+            .parse_statements()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sql parser error: Expected: an expression, found: EOF"
+        );
     }
 
     #[cfg(test)]
